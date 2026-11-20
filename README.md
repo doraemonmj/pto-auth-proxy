@@ -59,28 +59,42 @@ ps -o user,group,pid,args -C python3 | grep auth_proxy.py
                  ┌─────┴──────────────┐
                  │ 认证旁路            │ 放行后的业务流量
                  ▼                     ▼
- /run/pto-auth-proxy/<uid>/   上游 127.0.0.1:4780
+ /run/pto-auth-proxy/<uid>/   配置的本机 SOCKS5 上游
           authd.sock
-                 │             （SSH RemoteForward 落点）
+                 │             （mihomo / SSH 隧道等）
           用户自己的 authd              │
                  │                      ▼
-              PAM 验证          远端工作站 xray → Internet
+              PAM 验证          后端代理 → Internet
 ```
 
 共享代理以非 root 用户（默认 `pypto`）运行。每个用户的 `authd` 只服务自己的身份：
 首次接入通过 PAM 验证 Linux 密码并签发独立代理令牌，后续连接验证令牌；旧密码凭据
 仍保持兼容。socket 所有者和 `SO_PEERCRED` 用于校验调用方身份。
 
-`20808/20809` 是认证、白名单和审计入口，并不直接提供公网出口。每条认证并放行的
-业务连接都会通过 SOCKS5 转发到 `127.0.0.1:4780`。该端口是远端工作站建立的 SSH
-RemoteForward 在本机的落点，再由工作站上的 xray 访问 Internet；老版和新版都使用
-这条链路，新版只是把上游地址从硬编码改成了配置项。若 `4780` 未监听，认证仍可能
-成功，但业务请求会返回 `UPSTREAM-DEAD` 或 `502 Bad Gateway`。反向隧道应由建立它
-的远端工作站使用 systemd/autossh 保证重连，本机的 `pto-auth-proxy.service` 无法自行
-创建该远端隧道。
+`20808/20809` 是认证、白名单和审计入口，并不直接提供公网出口。放行的连接
+通过标准 SOCKS5 协议转发给配置的上游，不依赖 xray、mihomo 或隧道的具体实现。
+后端只需提供无需额外认证的 SOCKS5 接口；mihomo 的 mixed-port 也支持此协议。
+
+管理员必须在 `config/auth-proxy.env` 中显式填写 `PTO_AUTH_PROXY_UPSTREAM_PORT`，
+没有默认端口，也不会扫描端口或回退到历史值。`PTO_AUTH_PROXY_UPSTREAM_HOST` 默认
+为 `127.0.0.1`。例如目标主机 mihomo 实际监听 7895 时：
+
+```bash
+PTO_AUTH_PROXY_UPSTREAM_HOST=127.0.0.1
+PTO_AUTH_PROXY_UPSTREAM_PORT=7895
+PTO_AUTH_PROXY_GUARD_PORTS=
+```
+
+`PTO_AUTH_PROXY_GUARD_PORTS` 留空或省略时只保护实际上游端口；需要额外保护端口时
+填写逗号分隔列表，且必须包含上游端口，否则 `validate` 和守卫启动都会拒绝。
+历史部署的 4780/4781 是 SSH RemoteForward 方案的主机配置，不是协议要求。
+迁移旧配置时应同时清理残留的守卫列表，不能只改 `UPSTREAM_PORT`。
+
+后端服务及 SSH 隧道由各自的 systemd/autossh 等负责启动与重连，本工具不创建它们。
+上游不可用时，认证仍可能成功，但业务请求会返回 `UPSTREAM-DEAD` 或 `502 Bad Gateway`。
 
 `pto-auth-proxy-egress-guard.service` 使用 IPv4/IPv6 `iptables owner` 规则保护
-配置项 `PTO_AUTH_PROXY_GUARD_PORTS` 指定的回环上游端口（默认 `4780/4781`）：只有
+配置项 `PTO_AUTH_PROXY_GUARD_PORTS` 指定的回环上游端口（默认跟随上游端口）：只有
 代理服务账号（默认 `pypto`）能够直接连接这些端口。普通用户
 必须通过认证入口 `20808/20809`，即使属于 `proxyusers` 组也不能绕过认证直连上游。
 守卫服务独立于主代理运行，启动或重载规则不需要重启主代理。它每30秒检查一次规则，
@@ -173,7 +187,7 @@ sudo ./scripts/install.sh --install-updater
 sudo ./scripts/install.sh --enable-updater
 ```
 
-首次上线前先校验配置；确认生产端口未被其他进程占用后，再显式启动：
+首次生成的配置将上游端口留空，必须先按实际后端填写。首次上线前先校验配置；确认生产端口未被其他进程占用后，再显式启动：
 
 ```bash
 sudo -u pypto pto-auth-proxy validate
@@ -232,7 +246,8 @@ socket 的重复 daemon。`join` 只要求输入一次密码：PAM 验证成功�
 10 分钟宽限，避免正在运行的工具突然断线。
 
 日常自检只需运行 `pto-auth-proxy status`。它会用一行结果检查组成员、authd、凭据、
-`20809` 认证链路、守卫服务以及 `4780/4781` 直连隔离，不会打印凭据。主代理对客户
+`20809` 认证链路、守卫服务以及配置上游的直连隔离，并输出 `upstream=主机:端口`，不会打印凭据。
+该地址来自本地配置；改配置后还需重启主代理才能生效，排查时应核对最近启动日志中的 `upstream`。主代理对客户
 端握手、上游连接、上游握手、半关闭收尾和关闭阶段均设有本机超时；上游异常时会快速失败并回收
 双向转发任务，不会长期积累挂起连接。
 
@@ -283,7 +298,12 @@ commit 重复使用会被拒绝；回退到旧 commit 还必须显式设置
 timer 每天北京时间 03:37 检查一次，并加入最多20分钟的随机延迟，避免所有服务器
 同时访问主仓。服务器关机错过该窗口时不会在白天补跑，等待下一天即可。
 在本机没有直接公网出口时，仓库拉取以非 root 代理服务账号通过受出口守卫保护的本地
-SOCKS 上游完成，不复制用户 token。更新器只接受目标分支历史中的完整 commit，先以
+SOCKS 上游完成，不复制用户 token。新生成的 `config/auto-update.env` 在每次执行时读取
+同目录的 `auth-proxy.env`，由同一上游主机和端口生成更新器出口，不单独写死端口。
+已有 `auto-update.env` 按安装约定保留；旧版中固定的
+`REPO_AUTO_UPDATE_FETCH_ALL_PROXY` 不会自动改变。升级时需由管理员将该文件中的
+出口配置段替换为目标版本 `config/auto-update.env.in` 的动态读取段，并替换安装路径占位符；
+保留其他本地更新策略。更新器只接受目标分支历史中的完整 commit，先以
 非 root 代理账号运行候选仓库测试，成功后才安装。它保留本地配置、白名单、状态和
 日志，也不会运行 `systemctl restart`：
 新版本标记为 `pending-activation`，在管理员下次计划重启或服务器开机时自然激活。

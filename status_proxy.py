@@ -139,8 +139,7 @@ def guard_service_active() -> bool:
 
 
 def guard_ports(upstream_port: int) -> tuple[int, ...]:
-    raw = os.environ.get(
-        "PTO_AUTH_PROXY_GUARD_PORTS", f"{upstream_port},4781")
+    raw = os.environ.get("PTO_AUTH_PROXY_GUARD_PORTS") or str(upstream_port)
     try:
         ports = tuple(int(value) for value in raw.split(","))
     except ValueError:
@@ -162,7 +161,13 @@ def main() -> int:
     host = os.environ.get("PTO_AUTH_PROXY_LISTEN_HOST", "127.0.0.1")
     port = int(os.environ.get("PTO_AUTH_PROXY_HTTP_PORT", "20809"))
     upstream_host = os.environ.get("PTO_AUTH_PROXY_UPSTREAM_HOST", "127.0.0.1")
-    upstream_port = int(os.environ.get("PTO_AUTH_PROXY_UPSTREAM_PORT", "4780"))
+    try:
+        upstream_port = int(os.environ.get("PTO_AUTH_PROXY_UPSTREAM_PORT", ""))
+        if not 1 <= upstream_port <= 65535:
+            raise ValueError
+    except ValueError:
+        print("NOT_READY: upstream=unconfigured; set PTO_AUTH_PROXY_UPSTREAM_PORT")
+        return 1
     protected_ports = guard_ports(upstream_port)
     disabled = access_disabled()
 
@@ -176,12 +181,15 @@ def main() -> int:
     guard_service_ok = guard_service_active()
     direct_ok = bool(protected_ports) and direct_access_is_correct(
         user, owner, upstream_host, protected_ports)
-    guard_ok = guard_service_ok and direct_ok
+    coverage_ok = upstream_port in protected_ports
+    guard_ok = guard_service_ok and direct_ok and coverage_ok
 
     ready = member_ok and authd_ok and connect_status == "200" and guard_ok
     state = "READY" if ready else "LEFT" if disabled else "NOT_READY"
     if not guard_service_ok:
         guard_state = "service-down"
+    elif not coverage_ok:
+        guard_state = "upstream-unprotected"
     elif not direct_ok:
         guard_state = "rule-wrong"
     else:
@@ -189,7 +197,8 @@ def main() -> int:
     print(
         f"{state}: group={'ok' if member_ok else 'missing'} "
         f"authd={authd_mode} credential={config_source} "
-        f"proxy={connect_status} guard={guard_state}"
+        f"proxy={connect_status} guard={guard_state} "
+        f"upstream={upstream_host}:{upstream_port}"
     )
     return 0 if ready else 1
 

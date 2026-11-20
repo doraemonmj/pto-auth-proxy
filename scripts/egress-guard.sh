@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 CHAIN=PTO_AUTH_PROXY_GUARD
 PROXY_USER=${2:-pypto}
-PORTS=${3:-${PTO_AUTH_PROXY_GUARD_PORTS:-${PTO_AUTH_PROXY_UPSTREAM_PORT:-4780},4781}}
+PORTS=${3:-${PTO_AUTH_PROXY_GUARD_PORTS:-${PTO_AUTH_PROXY_UPSTREAM_PORT:-}}}
 
 IFS=, read -r -a port_values <<<"$PORTS"
 ((${#port_values[@]} > 0)) || {
@@ -11,11 +11,30 @@ IFS=, read -r -a port_values <<<"$PORTS"
     exit 2
 }
 for port in "${port_values[@]}"; do
-    [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || {
+    [[ "$port" =~ ^[0-9]+$ ]] && ((10#$port >= 1 && 10#$port <= 65535)) || {
         echo "invalid egress guard port: $port" >&2
         exit 2
     }
 done
+
+# Reject a stale guard configuration before changing any firewall rules.
+if [[ -n ${PTO_AUTH_PROXY_UPSTREAM_PORT:-} && ${1:-} != stop ]]; then
+    [[ "$PTO_AUTH_PROXY_UPSTREAM_PORT" =~ ^[0-9]+$ ]] &&
+        ((10#$PTO_AUTH_PROXY_UPSTREAM_PORT >= 1 && 10#$PTO_AUTH_PROXY_UPSTREAM_PORT <= 65535)) || {
+        echo "invalid PTO_AUTH_PROXY_UPSTREAM_PORT" >&2
+        exit 2
+    }
+    upstream_guarded=0
+    for port in "${port_values[@]}"; do
+        if ((10#$port == 10#$PTO_AUTH_PROXY_UPSTREAM_PORT)); then
+            upstream_guarded=1
+        fi
+    done
+    ((upstream_guarded)) || {
+        echo "egress guard ports must include PTO_AUTH_PROXY_UPSTREAM_PORT" >&2
+        exit 2
+    }
+fi
 
 usage() {
     echo "Usage: $0 {start|reload|stop|check|watch} [PROXY_USER] [PORTS]" >&2
