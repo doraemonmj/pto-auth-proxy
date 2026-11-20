@@ -9,6 +9,8 @@ PROXY_USER=${1:-$(id -un)}
 HTTP_HOST=${PTO_AUTH_PROXY_LISTEN_HOST:-127.0.0.1}
 HTTP_PORT=${PTO_AUTH_PROXY_HTTP_PORT:-20809}
 SOCKS_PORT=${PTO_AUTH_PROXY_SOCKS_PORT:-20808}
+AUTO_HTTP_PORT=${PTO_AUTH_PROXY_AUTO_HTTP_PORT:-20811}
+AUTO_SOCKS_PORT=${PTO_AUTH_PROXY_AUTO_SOCKS_PORT:-20810}
 CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}/pto-auth-proxy
 SECRET_FILE=$CONFIG_HOME/secret-uri
 ENV_FILE=$CONFIG_HOME/env.sh
@@ -29,6 +31,12 @@ LEGACY_END_MARKER='# ---------------------------------'
     echo "Invalid SOCKS5 proxy port: $SOCKS_PORT" >&2
     exit 2
 }
+
+for auto_port in "$AUTO_HTTP_PORT" "$AUTO_SOCKS_PORT"; do
+    [[ "$auto_port" =~ ^[0-9]+$ ]] && ((10#$auto_port >= 1 && 10#$auto_port <= 65535)) || {
+        echo "Invalid auto proxy port" >&2; exit 2;
+    }
+done
 
 case "$HTTP_HOST" in
     *:*) HTTP_URL_HOST="[$HTTP_HOST]" ;;
@@ -109,17 +117,20 @@ COMMAND_PATH=$(readlink -f -- "$COMMAND_PATH")
     printf '_PTO_PROXY_HOST=%q\n' "$HTTP_URL_HOST"
     printf '_PTO_PROXY_HTTP_PORT=%q\n' "$HTTP_PORT"
     printf '_PTO_PROXY_SOCKS_PORT=%q\n' "$SOCKS_PORT"
+    printf '_PTO_PROXY_AUTO_HTTP_PORT=%q\n' "$AUTO_HTTP_PORT"
+    printf '_PTO_PROXY_AUTO_SOCKS_PORT=%q\n' "$AUTO_SOCKS_PORT"
     printf '_PTO_PROXY_COMMAND=%q\n' "$COMMAND_PATH"
     printf '. %q\n' "$SCRIPT_DIR/shell-integration.sh"
 } >"$env_tmp"
 # Non-sensitive endpoint metadata is also used by exec without shell integration.
-python3 - "$CONFIG_HOME/endpoints.json" "$HTTP_HOST" "$HTTP_PORT" "$SOCKS_PORT" <<'ENDPOINTS'
+python3 - "$CONFIG_HOME/endpoints.json" "$HTTP_HOST" "$HTTP_PORT" "$SOCKS_PORT" "$AUTO_HTTP_PORT" "$AUTO_SOCKS_PORT" <<'ENDPOINTS'
 import json, os, sys, tempfile
-path, host, http_port, socks_port = sys.argv[1:]
+path, host, http_port, socks_port, auto_http_port, auto_socks_port = sys.argv[1:]
 fd, temporary = tempfile.mkstemp(prefix=".endpoints-", dir=os.path.dirname(path))
 try:
     with os.fdopen(fd, "w") as stream:
-        json.dump({"host": host, "http_port": int(http_port), "socks_port": int(socks_port)}, stream)
+        json.dump({"host": host, "http_port": int(http_port), "socks_port": int(socks_port),
+                   "auto_http_port": int(auto_http_port), "auto_socks_port": int(auto_socks_port)}, stream)
     os.replace(temporary, path)
 finally:
     if os.path.exists(temporary):
@@ -157,4 +168,4 @@ else
 fi
 
 echo "Stored proxy credentials in $SECRET_FILE (mode 0600)"
-echo "New shells will use authenticated proxies $HTTP_HOST:$HTTP_PORT (HTTP) and $HTTP_HOST:$SOCKS_PORT (SOCKS5)"
+echo "New shells default to auto routing; explicit saved preferences are preserved."

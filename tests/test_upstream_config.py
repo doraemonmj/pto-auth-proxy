@@ -41,6 +41,12 @@ class UpstreamConfigTest(unittest.TestCase):
                 result = self.validate(f'PTO_AUTH_PROXY_UPSTREAM_PORT={port}\n')
                 self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_auto_ports_must_not_collide_with_other_listeners_or_upstream(self):
+        for extra in ("PTO_AUTH_PROXY_AUTO_HTTP_PORT=20809\n", "PTO_AUTH_PROXY_AUTO_SOCKS_PORT=7895\n",
+                      "PTO_AUTH_PROXY_UPSTREAM_PORT=020810\n"):
+            result = self.validate("PTO_AUTH_PROXY_UPSTREAM_PORT=7895\n" + extra)
+            self.assertNotEqual(result.returncode, 0)
+
     def test_stale_guard_is_rejected_and_custom_guard_is_accepted(self):
         result = self.validate('PTO_AUTH_PROXY_UPSTREAM_PORT=7895\n'
                                'PTO_AUTH_PROXY_GUARD_PORTS=4780,4781\n')

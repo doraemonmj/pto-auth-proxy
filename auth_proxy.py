@@ -3,8 +3,9 @@
 
 Runs on shared Linux hosts. Users authenticate through their per-user authd.
 Only members of PROXY_GROUP are allowed in, even with correct credentials.
-Matching destinations are forwarded to an explicitly configured SOCKS5 upstream,
-independent of its implementation (for example mihomo or an SSH tunnel).
+Auto listeners route selected domains through an explicitly configured SOCKS5
+upstream and other public HTTP(S) targets directly. Forced proxy listeners retain
+whitelist-only upstream access. All forwarding requires user authentication.
 
 Per-connection facts append to stats.jsonl; a plain text log lands in
 auth_proxy.log. SIGHUP reloads the whitelist file (if present); SIGTERM/INT
@@ -15,6 +16,7 @@ Dependencies: Python 3 stdlib + libpam.so.0 (present on any Linux with PAM).
 from __future__ import annotations
 import asyncio
 import fnmatch
+from functools import partial
 import grp
 import ipaddress
 import json
@@ -27,6 +29,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 # NOTE: this proxy no longer imports the pam module directly. Cross-user PAM
 # verification is refused by unix_chkpwd on openEuler for unprivileged
 # callers, so we delegate password checks to a per-user authd daemon (see
@@ -62,6 +65,8 @@ BASE_DIR       = Path(os.environ.get("AUTHPROXY_DIR",
                                      Path.home() / "auth-proxy")).resolve()
 WHITELIST_FILE = Path(os.environ.get(
     "PTO_AUTH_PROXY_WHITELIST", BASE_DIR / "whitelist.txt")).resolve()
+PROXY_DOMAINS_FILE = Path(os.environ.get(
+    "PTO_AUTH_PROXY_PROXY_DOMAINS") or WHITELIST_FILE.with_name("proxy-domains.txt")).resolve()
 STATS_FILE     = Path(os.environ.get(
     "PTO_AUTH_PROXY_STATS_FILE", BASE_DIR / "stats.jsonl")).resolve()
 LOG_FILE       = Path(os.environ.get(
@@ -86,6 +91,11 @@ REPORT_MINUTE = 5
 LISTEN_HOST    = os.environ.get("PTO_AUTH_PROXY_LISTEN_HOST", "127.0.0.1")
 LISTEN_PORT    = _env_port("PTO_AUTH_PROXY_SOCKS_PORT", 20808)
 HTTP_LISTEN_PORT = _env_port("PTO_AUTH_PROXY_HTTP_PORT", 20809)
+AUTO_SOCKS_PORT = _env_port("PTO_AUTH_PROXY_AUTO_SOCKS_PORT", 20810)
+AUTO_HTTP_PORT = _env_port("PTO_AUTH_PROXY_AUTO_HTTP_PORT", 20811)
+DIRECT_PORTS = {int(value) for value in os.environ.get("PTO_AUTH_PROXY_DIRECT_PORTS", "80,443").split(",")}
+if not DIRECT_PORTS or any(not 1 <= port <= 65535 for port in DIRECT_PORTS):
+    raise SystemExit("PTO_AUTH_PROXY_DIRECT_PORTS must contain valid ports")
 # Every allowed business connection is chained through this SOCKS5 endpoint.
 # The endpoint may be a local SOCKS5 service or an SSH RemoteForward.
 # Do not infer the backend implementation or silently choose a legacy port.
@@ -278,6 +288,70 @@ def host_allowed(host: str) -> bool:
     return any(fnmatch.fnmatch(h, pat) for pat in _whitelist)
 
 
+_proxy_domains: list[str] = []
+
+
+def load_proxy_domains() -> None:
+    global _proxy_domains
+    path = PROXY_DOMAINS_FILE
+    if not path.exists():
+        if os.environ.get("PTO_AUTH_PROXY_PROXY_DOMAINS"):
+            raise ValueError("configured proxy-domains file is missing")
+        # Upgrades preserve config. Missing optional routing config uses the
+        # shipped defaults, without overwriting administrator-owned files.
+        path = Path(__file__).parent / "proxy-domains.txt"
+        if not path.exists():
+            path = Path(__file__).parent / "config/proxy-domains.txt"
+    _proxy_domains = [line.strip().lower() for line in path.read_text().splitlines()
+                      if line.strip() and not line.lstrip().startswith("#")]
+    log(f"loaded {len(_proxy_domains)} auto proxy domains from {path}")
+
+
+def target_route(host: str, mode: str) -> str:
+    if mode == "proxy":
+        return "proxy"
+    if mode != "auto":
+        raise ValueError("invalid routing mode")
+    return "proxy" if any(fnmatch.fnmatch(host.lower().rstrip("."), pattern)
+                          for pattern in _proxy_domains) else "direct"
+
+
+class DirectDenied(Exception):
+    pass
+
+
+async def open_direct(host: str, port: int):
+    """Resolve once and connect only to checked numeric public addresses.
+
+    The shared owner has privileged access to the loopback upstream. This
+    forwarding path must never become a route to that endpoint or internal IPs.
+    """
+    if port not in DIRECT_PORTS:
+        raise DirectDenied("direct destination port is not enabled")
+
+    async def connect():
+        addresses = await asyncio.get_running_loop().getaddrinfo(
+            host, port, type=socket.SOCK_STREAM)
+        if not addresses:
+            raise OSError("no destination addresses")
+        targets = set()
+        for family, _, _, _, address in addresses:
+            ip = ipaddress.ip_address(address[0].split("%", 1)[0])
+            if not ip.is_global or ip.is_multicast or ip.is_loopback or ip.is_link_local:
+                raise DirectDenied("direct destinations must resolve only to public addresses")
+            targets.add((family, address[0]))
+        for family, address in sorted(targets):
+            try:
+                return await asyncio.wait_for(
+                    asyncio.open_connection(address, port, family=family),
+                    timeout=UPSTREAM_CONNECT_TIMEOUT / len(targets))
+            except (OSError, asyncio.TimeoutError):
+                continue
+        raise OSError("direct destination unreachable")
+
+    return await asyncio.wait_for(connect(), timeout=UPSTREAM_CONNECT_TIMEOUT)
+
+
 # ============================================================
 # Logging / stats
 # ============================================================
@@ -413,11 +487,12 @@ async def _read_addr(r: asyncio.StreamReader, atyp: int) -> str:
     raise ValueError(f"bad atyp {atyp}")
 
 
-async def handle(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> None:
+async def handle(cr: asyncio.StreamReader, cw: asyncio.StreamWriter, *, route_mode: str = "proxy") -> None:
     peer = cw.get_extra_info("peername")
     peer_str = f"{peer[0]}:{peer[1]}" if peer else "?"
     user, host, port = "-", "", 0
     verdict = "?"
+    route = "-"
     up_writer: Optional[asyncio.StreamWriter] = None
     up_bytes, down_bytes = [0], [0]
     t0 = time.monotonic()
@@ -483,65 +558,81 @@ async def handle(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> None:
             return
         port = struct.unpack("!H", await _client_readexactly(cr, 2))[0]
 
-        # 4. Whitelist check
-        if not host_allowed(host):
+        # Routing does not grant upstream access: both modes retain whitelist checks.
+        route = target_route(host, route_mode)
+        if route == "proxy" and not host_allowed(host):
             cw.write(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")
             await cw.drain()
             verdict = "denied"
             log(f"DENY  user={user} -> {host}:{port}")
             return
 
-        # 5. Connect upstream, do plain SOCKS5 handshake, forward CONNECT
-        try:
-            up_reader, up_writer = await asyncio.wait_for(
-                asyncio.open_connection(UPSTREAM_HOST, UPSTREAM_PORT),
-                timeout=UPSTREAM_CONNECT_TIMEOUT)
-        except (OSError, asyncio.TimeoutError) as e:
-            cw.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
+        if route == "direct":
+            try:
+                up_reader, up_writer = await open_direct(host, port)
+            except DirectDenied:
+                verdict = "direct_denied"
+                cw.write(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")
+                await cw.drain()
+                return
+            except OSError:
+                verdict = "direct_dead"
+                cw.write(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
+                await cw.drain()
+                return
+            cw.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
             await cw.drain()
-            verdict = "upstream_dead"
-            log(f"UPSTREAM-DEAD user={user} -> {host}:{port}: {e}")
-            return
+        else:
+            try:
+                up_reader, up_writer = await asyncio.wait_for(
+                    asyncio.open_connection(UPSTREAM_HOST, UPSTREAM_PORT),
+                    timeout=UPSTREAM_CONNECT_TIMEOUT)
+            except (OSError, asyncio.TimeoutError) as e:
+                cw.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
+                await cw.drain()
+                verdict = "upstream_dead"
+                log(f"UPSTREAM-DEAD user={user} -> {host}:{port}: {e}")
+                return
 
-        up_writer.write(b"\x05\x01\x00")
-        await _upstream_drain(up_writer)
-        if (await _upstream_readexactly(up_reader, 2)) != b"\x05\x00":
-            cw.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
+            up_writer.write(b"\x05\x01\x00")
+            await _upstream_drain(up_writer)
+            if (await _upstream_readexactly(up_reader, 2)) != b"\x05\x00":
+                cw.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
+                await cw.drain()
+                verdict = "upstream_authneg"
+                return
+
+            if atyp == 0x03:
+                addr_bytes = bytes([len(host)]) + host.encode("ascii")
+            elif atyp == 0x01:
+                addr_bytes = socket.inet_aton(host)
+            else:
+                addr_bytes = socket.inet_pton(socket.AF_INET6, host)
+            up_writer.write(b"\x05\x01\x00" + bytes([atyp]) + addr_bytes
+                            + struct.pack("!H", port))
+            await _upstream_drain(up_writer)
+
+            rep = await _upstream_readexactly(up_reader, 4)
+            cw.write(rep)
+            rep_atyp = rep[3]
+            if rep_atyp == 0x01:
+                cw.write(await _upstream_readexactly(up_reader, 4 + 2))
+            elif rep_atyp == 0x03:
+                ln = (await _upstream_readexactly(up_reader, 1))[0]
+                cw.write(bytes([ln]) + await _upstream_readexactly(up_reader, ln + 2))
+            elif rep_atyp == 0x04:
+                cw.write(await _upstream_readexactly(up_reader, 16 + 2))
+            else:
+                verdict = "upstream_bad_reply"
+                return
             await cw.drain()
-            verdict = "upstream_authneg"
-            return
-
-        if atyp == 0x03:
-            addr_bytes = bytes([len(host)]) + host.encode("ascii")
-        elif atyp == 0x01:
-            addr_bytes = socket.inet_aton(host)
-        else:
-            addr_bytes = socket.inet_pton(socket.AF_INET6, host)
-        up_writer.write(b"\x05\x01\x00" + bytes([atyp]) + addr_bytes
-                        + struct.pack("!H", port))
-        await _upstream_drain(up_writer)
-
-        rep = await _upstream_readexactly(up_reader, 4)
-        cw.write(rep)
-        rep_atyp = rep[3]
-        if rep_atyp == 0x01:
-            cw.write(await _upstream_readexactly(up_reader, 4 + 2))
-        elif rep_atyp == 0x03:
-            ln = (await _upstream_readexactly(up_reader, 1))[0]
-            cw.write(bytes([ln]) + await _upstream_readexactly(up_reader, ln + 2))
-        elif rep_atyp == 0x04:
-            cw.write(await _upstream_readexactly(up_reader, 16 + 2))
-        else:
-            verdict = "upstream_bad_reply"
-            return
-        await cw.drain()
-        if rep[1] != 0x00:
-            verdict = f"upstream_rep_{rep[1]}"
-            log(f"UPSTREAM-REJECT user={user} -> {host}:{port} rep={rep[1]}")
-            return
+            if rep[1] != 0x00:
+                verdict = f"upstream_rep_{rep[1]}"
+                log(f"UPSTREAM-REJECT user={user} -> {host}:{port} rep={rep[1]}")
+                return
 
         verdict = "ok"
-        log(f"ALLOW user={user} -> {host}:{port}")
+        log(f"ALLOW user={user} -> {host}:{port} route={route}")
 
         # 6. Full-duplex
         await _relay(cr, cw, up_reader, up_writer, up_bytes, down_bytes)
@@ -562,6 +653,8 @@ async def handle(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> None:
             "host": host,
             "port": port,
             "verdict": verdict,
+            "route": route,
+            "mode": route_mode,
             "bytes_up":   up_bytes[0],
             "bytes_down": down_bytes[0],
             "duration":   round(time.monotonic() - t0, 3),
@@ -573,7 +666,7 @@ async def handle(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> None:
 # speaks HTTP proxy, e.g. Claude Code). Listens on HTTP_LISTEN_PORT.
 # Flow:
 #   1. Read request line + headers
-#   2. Method MUST be CONNECT (we don't do plain-HTTP proxying)
+#   2. CONNECT tunnels HTTPS; absolute-form http:// requests are forwarded
 #   3. Enforce Proxy-Authorization: Basic user:pw   -> authd
 #   4. Enforce whitelist on the CONNECT target
 #   5. Open SOCKS5 to the configured UPSTREAM and hand it the target
@@ -601,11 +694,12 @@ async def _read_http_headers(reader: asyncio.StreamReader,
     return lines[0], lines[1:], tail
 
 
-async def handle_http(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> None:
+async def handle_http(cr: asyncio.StreamReader, cw: asyncio.StreamWriter, *, route_mode: str = "proxy") -> None:
     peer = cw.get_extra_info("peername")
     peer_str = f"{peer[0]}:{peer[1]}" if peer else "?"
     user, host, port = "-", "", 0
     verdict = "?"
+    route = "-"
     up_writer: Optional[asyncio.StreamWriter] = None
     up_bytes, down_bytes = [0], [0]
     t0 = time.monotonic()
@@ -639,23 +733,29 @@ async def handle_http(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> Non
                 headers[k.strip().lower().decode("ascii", "replace")] = \
                     v.strip().decode("utf-8", "replace")
 
-        if method.upper() != b"CONNECT":
-            verdict = "method_unsupp"
-            await _reply("405 Method Not Allowed",
-                         "this proxy only supports CONNECT (tunnel HTTPS)\n",
-                         extra="Allow: CONNECT\r\n")
-            return
-
-        # target must be host:port
-        if b":" not in target:
-            verdict = "bad_target"
-            await _reply("400 Bad Request", "CONNECT target must be host:port\n")
-            return
-        host_b, _, port_b = target.rpartition(b":")
-        host = host_b.decode("ascii", "replace")
-        try:
-            port = int(port_b)
-        except ValueError:
+        tunnel = method.upper() == b"CONNECT"
+        if tunnel:
+            if b":" not in target:
+                verdict = "bad_target"
+                await _reply("400 Bad Request", "CONNECT target must be host:port\n")
+                return
+            host_b, _, port_b = target.rpartition(b":")
+            host = host_b.decode("ascii", "strict")
+            if host.startswith("[") and host.endswith("]"):
+                host = host[1:-1]
+            try:
+                port = int(port_b)
+            except ValueError:
+                port = 0
+        else:
+            parsed = urlsplit(target.decode("ascii", "strict"))
+            if parsed.scheme != "http" or not parsed.hostname or parsed.username is not None or parsed.password is not None:
+                verdict = "bad_target"
+                await _reply("400 Bad Request", "absolute http:// target required\n")
+                return
+            host = parsed.hostname
+            port = parsed.port or 80
+        if not 1 <= port <= 65535:
             verdict = "bad_target"
             await _reply("400 Bad Request", "invalid port\n")
             return
@@ -695,59 +795,88 @@ async def handle_http(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> Non
                          extra='Proxy-Authenticate: Basic realm="authproxy"\r\n')
             return
 
-        # Whitelist
-        if not host_allowed(host):
+        route = target_route(host, route_mode)
+        if route == "proxy" and not host_allowed(host):
             verdict = "denied"
             log(f"HTTP DENY user={user} -> {host}:{port}")
             await _reply("403 Forbidden",
                          f"destination {host} not on whitelist\n")
             return
 
-        # Connect upstream (SOCKS5) and do CONNECT via it
-        try:
-            up_reader, up_writer = await asyncio.wait_for(
-                asyncio.open_connection(UPSTREAM_HOST, UPSTREAM_PORT),
-                timeout=UPSTREAM_CONNECT_TIMEOUT)
-        except (OSError, asyncio.TimeoutError) as e:
-            verdict = "upstream_dead"
-            log(f"HTTP UPSTREAM-DEAD user={user} -> {host}:{port}: {e}")
-            await _reply("502 Bad Gateway", "upstream tunnel unreachable\n")
-            return
+        if route == "direct":
+            try:
+                up_reader, up_writer = await open_direct(host, port)
+            except DirectDenied:
+                verdict = "direct_denied"
+                await _reply("403 Forbidden", "direct target must be public and use an enabled port\n")
+                return
+            except OSError:
+                verdict = "direct_dead"
+                await _reply("502 Bad Gateway", "direct destination unreachable\n")
+                return
+        else:
+            try:
+                up_reader, up_writer = await asyncio.wait_for(
+                    asyncio.open_connection(UPSTREAM_HOST, UPSTREAM_PORT),
+                    timeout=UPSTREAM_CONNECT_TIMEOUT)
+            except (OSError, asyncio.TimeoutError) as e:
+                verdict = "upstream_dead"
+                log(f"HTTP UPSTREAM-DEAD user={user} -> {host}:{port}: {e}")
+                await _reply("502 Bad Gateway", "upstream tunnel unreachable\n")
+                return
 
-        # SOCKS5 no-auth handshake
-        up_writer.write(b"\x05\x01\x00")
-        await _upstream_drain(up_writer)
-        if (await _upstream_readexactly(up_reader, 2)) != b"\x05\x00":
-            verdict = "upstream_authneg"
-            await _reply("502 Bad Gateway", "upstream socks handshake failed\n")
-            return
+            # SOCKS5 no-auth handshake
+            up_writer.write(b"\x05\x01\x00")
+            await _upstream_drain(up_writer)
+            if (await _upstream_readexactly(up_reader, 2)) != b"\x05\x00":
+                verdict = "upstream_authneg"
+                await _reply("502 Bad Gateway", "upstream socks handshake failed\n")
+                return
 
-        addr_bytes = bytes([len(host)]) + host.encode("ascii")
-        up_writer.write(b"\x05\x01\x00\x03" + addr_bytes + struct.pack("!H", port))
-        await _upstream_drain(up_writer)
+            try:
+                ip = ipaddress.ip_address(host)
+                address = (b"\x01" if ip.version == 4 else b"\x04") + ip.packed
+            except ValueError:
+                encoded = host.encode("idna")
+                address = b"\x03" + bytes([len(encoded)]) + encoded
+            up_writer.write(b"\x05\x01\x00" + address + struct.pack("!H", port))
+            await _upstream_drain(up_writer)
 
-        rep = await _upstream_readexactly(up_reader, 4)
-        rep_atyp = rep[3]
-        if rep_atyp == 0x01:
-            await _upstream_readexactly(up_reader, 4 + 2)
-        elif rep_atyp == 0x03:
-            ln = (await _upstream_readexactly(up_reader, 1))[0]
-            await _upstream_readexactly(up_reader, ln + 2)
-        elif rep_atyp == 0x04:
-            await _upstream_readexactly(up_reader, 16 + 2)
+            rep = await _upstream_readexactly(up_reader, 4)
+            rep_atyp = rep[3]
+            if rep_atyp == 0x01:
+                await _upstream_readexactly(up_reader, 4 + 2)
+            elif rep_atyp == 0x03:
+                ln = (await _upstream_readexactly(up_reader, 1))[0]
+                await _upstream_readexactly(up_reader, ln + 2)
+            elif rep_atyp == 0x04:
+                await _upstream_readexactly(up_reader, 16 + 2)
 
-        if rep[1] != 0x00:
-            verdict = f"upstream_rep_{rep[1]}"
-            log(f"HTTP UPSTREAM-REJECT user={user} -> {host}:{port} rep={rep[1]}")
-            await _reply("502 Bad Gateway",
-                         f"upstream refused (socks rep={rep[1]})\n")
-            return
+            if rep[1] != 0x00:
+                verdict = f"upstream_rep_{rep[1]}"
+                log(f"HTTP UPSTREAM-REJECT user={user} -> {host}:{port} rep={rep[1]}")
+                await _reply("502 Bad Gateway",
+                             f"upstream refused (socks rep={rep[1]})\n")
+                return
 
-        # Success: tell the client the tunnel is up
-        cw.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        await cw.drain()
+        if tunnel:
+            cw.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await cw.drain()
+        else:
+            # Remove proxy credentials and hop-by-hop control from origin requests.
+            origin = (parsed.path or "/") + (("?" + parsed.query) if parsed.query else "")
+            outgoing = method + b" " + origin.encode("ascii") + b" HTTP/1.1\r\n"
+            for header in header_lines:
+                name = header.partition(b":")[0].strip().lower()
+                if name not in {b"proxy-authorization", b"proxy-connection", b"connection", b"keep-alive", b"host"}:
+                    outgoing += header + b"\r\n"
+            host_header = f"[{host}]" if ":" in host else host
+            outgoing += f"Host: {host_header}:{port}\r\nConnection: close\r\n\r\n".encode("ascii")
+            up_bytes[0] += len(outgoing)
+            up_writer.write(outgoing)
+            await up_writer.drain()
         verdict = "ok"
-        log(f"HTTP ALLOW user={user} -> {host}:{port}")
+        log(f"HTTP ALLOW user={user} -> {host}:{port} route={route}")
 
         # A client may coalesce the first TLS bytes with the CONNECT headers.
         # Preserve them instead of silently dropping them during header parsing.
@@ -778,6 +907,8 @@ async def handle_http(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> Non
             "host": host,
             "port": port,
             "verdict": verdict,
+            "route": route,
+            "mode": route_mode,
             "bytes_up":   up_bytes[0],
             "bytes_down": down_bytes[0],
             "duration":   round(time.monotonic() - t0, 3),
@@ -972,7 +1103,7 @@ def _run_anomaly_scan() -> None:
         per_user_conns[u]      += 1
         if v == "auth_fail":
             per_user_authfail[u] += 1
-        elif v == "denied":
+        elif v in {"denied", "direct_denied"}:
             per_user_deny[u] += 1
             host = e.get("host") or ""
             if host:
@@ -1079,7 +1210,7 @@ def _generate_report(day: _dt.date) -> None:
                     pu["ok"] += 1; totals["ok"] += 1
                 elif v == "auth_fail":
                     pu["auth_fail"] += 1; totals["auth_fail"] += 1
-                elif v == "denied":
+                elif v in {"denied", "direct_denied"}:
                     pu["denied"] += 1; totals["denied"] += 1
                 bu = e.get("bytes_up", 0); bd = e.get("bytes_down", 0)
                 pu["bytes_up"] += bu; pu["bytes_down"] += bd
@@ -1197,6 +1328,7 @@ async def main() -> None:
     except KeyError:
         pass
     load_whitelist()
+    load_proxy_domains()
     load_group()
 
     loop = asyncio.get_running_loop()
@@ -1204,6 +1336,7 @@ async def main() -> None:
     def _on_hup():
         log("SIGHUP: reloading whitelist and group")
         load_whitelist()
+        load_proxy_domains()
         load_group()
 
     stop = asyncio.Event()
@@ -1213,24 +1346,32 @@ async def main() -> None:
     loop.add_signal_handler(signal.SIGINT,
                             lambda: (log("SIGINT: stopping"), stop.set()))
 
-    socks_server = await asyncio.start_server(handle, LISTEN_HOST, LISTEN_PORT)
-    http_server  = await asyncio.start_server(handle_http, LISTEN_HOST, HTTP_LISTEN_PORT)
-    for s in socks_server.sockets:
-        log(f"SOCKS5 listening on {s.getsockname()}")
-    for s in http_server.sockets:
-        log(f"HTTP CONNECT listening on {s.getsockname()}")
-    log(f"upstream {UPSTREAM_HOST}:{UPSTREAM_PORT}")
-    log(f"PAM service={PAM_SERVICE!r}, required group={PROXY_GROUP!r}")
-    log(f"stats file: {STATS_FILE}")
-
-    async with socks_server, http_server:
-        serve1     = asyncio.create_task(socks_server.serve_forever())
-        serve2     = asyncio.create_task(http_server.serve_forever())
-        anomaly    = asyncio.create_task(anomaly_scan_loop())
-        report     = asyncio.create_task(daily_report_loop())
-        await stop.wait()
-        for t in (serve1, serve2, anomaly, report):
-            t.cancel()
+    # Bind every endpoint before serving; close earlier sockets if a later bind fails.
+    servers = []
+    try:
+        for handler, port, mode in ((handle, LISTEN_PORT, "proxy"),
+                                    (handle_http, HTTP_LISTEN_PORT, "proxy"),
+                                    (handle, AUTO_SOCKS_PORT, "auto"),
+                                    (handle_http, AUTO_HTTP_PORT, "auto")):
+            server = await asyncio.start_server(partial(handler, route_mode=mode), LISTEN_HOST, port,
+                                                start_serving=False)
+            servers.append(server)
+            log(f"{mode} {handler.__name__} listening on {LISTEN_HOST}:{port}")
+        log(f"upstream {UPSTREAM_HOST}:{UPSTREAM_PORT}; direct ports={sorted(DIRECT_PORTS)}")
+        for server in servers:
+            await server.start_serving()
+        tasks = [asyncio.create_task(server.serve_forever()) for server in servers]
+        tasks += [asyncio.create_task(anomaly_scan_loop()), asyncio.create_task(daily_report_loop())]
+        try:
+            await stop.wait()
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        for server in servers:
+            server.close()
+        await asyncio.gather(*(server.wait_closed() for server in servers))
 
 
 if __name__ == "__main__":

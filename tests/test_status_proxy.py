@@ -192,6 +192,13 @@ class StatusTest(unittest.TestCase):
             with self.subTest(expected=expected), mock.patch.dict(os.environ, environment, clear=True):
                 self.assertEqual(status_proxy.shell_mode("127.0.0.1", 20809, 20808), expected)
 
+    def test_status_distinguishes_auto_from_forced_proxy(self):
+        for mode, http_port, socks_port in (("auto", 20811, 20810), ("proxy", 20809, 20808)):
+            environment = {key: f"socks5h://user:token@127.0.0.1:{socks_port}" if key.lower() == "all_proxy"
+                           else f"http://user:token@127.0.0.1:{http_port}" for key in status_proxy.user_proxy.PROXY_KEYS}
+            with mock.patch.dict(os.environ, environment, clear=True):
+                self.assertEqual(status_proxy.shell_mode("127.0.0.1", 20809, 20808), mode)
+
     def test_stopped_doctor_skips_new_authentication(self):
         (self.directory / "authd.stopped").touch()
         output = io.StringIO()

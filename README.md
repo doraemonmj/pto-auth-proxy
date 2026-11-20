@@ -1,17 +1,22 @@
 # pto-auth-proxy
 
-面向共享 Linux 服务器的认证出口代理。它在本机提供 SOCKS5 和 HTTP CONNECT
-入口，使用每位用户自己的 PAM `authd` 鉴权，并通过域名白名单限制外部访问。
+面向共享 Linux 服务器的认证出口代理。默认按域名自动分流，用户可临时强制代理或直连。
+本机 SOCKS5、HTTP/HTTPS 代理入口使用每位用户自己的 PAM `authd` 鉴权；上游代理
+访问仍受管理员白名单约束。
 
 ## 日常使用
 
 ```bash
 pto-auth-proxy status                        # 当前进程环境、默认偏好和个人 authd
 pto-auth-proxy doctor                        # 主动检查认证、上游、HTTPS 和出口守卫
-pto-auth-proxy on                            # 当前终端使用代理
-pto-auth-proxy off                           # 恢复原有代理环境，保留凭据和服务
+pto-auth-proxy auto                          # 默认：指定域名代理，其余直连
+pto-auth-proxy on                            # 出问题时，当前终端强制代理
+pto-auth-proxy off                           # 当前终端强制直连，保留凭据和服务
+pto-auth-proxy restore                       # 恢复工具接管前的原有环境
+pto-auth-proxy auto --default                # 保存自动分流为新终端默认偏好
 pto-auth-proxy off --default                 # 同时让新终端默认不用 PTO 代理
 pto-auth-proxy on --default                  # 同时让新终端默认使用 PTO 代理
+pto-auth-proxy exec --auto -- git fetch
 pto-auth-proxy exec --direct -- curl https://example.com
 pto-auth-proxy exec --proxy -- git fetch
 pto-auth-proxy stop                          # 停止自己的 authd，跨重启保留停用状态
@@ -19,7 +24,7 @@ pto-auth-proxy start                         # 恢复自己的 authd，无需重
 pto-auth-proxy restart                       # 只重启自己的 authd，不轮换 token
 ```
 
-`on/off` 依赖 Bash/Zsh shell 函数，才能立即改变当前终端。新接入的 `join` 会安装它；
+`auto/on/off/restore` 依赖 Bash/Zsh shell 函数，才能立即改变当前终端。新接入的 `join` 会安装它；
 已有接入升级时无需重新认证，运行下面两条命令即可：
 
 ```bash
@@ -27,12 +32,26 @@ pto-auth-proxy setup-shell
 source "${XDG_CONFIG_HOME:-$HOME/.config}/pto-auth-proxy/env.sh"
 ```
 
-`off` 恢复启用前的环境，原来配置了其他代理时会恢复该代理；只想让单个命令直连时，
-使用 `exec --direct`。它删除子进程中的大小写 HTTP/HTTPS/ALL_PROXY，并设置
-`NO_PROXY/no_proxy=*`。`exec --proxy` 临时注入认证代理环境，不改变当前终端或默认偏好。
-这两个命令保留被运行程序的退出状态和信号行为。Git/VS Code 等应用显式设置的代理
-可能优先于环境，`doctor` 会提示检测到的 Git 配置，但不会打印其值或自动修改它。
-服务器没有直接出口时，关闭代理不会让直连变得可用；工具不会自动切换到直连。
+新接入和没有显式偏好的老用户默认采用 `auto`；已保存的 `proxy/direct` 偏好保留。
+默认代理域名包括 OpenAI/Codex/ChatGPT、Claude 和 GitHub 核心服务；其他目标默认直连。
+管理员在 `config/proxy-domains.txt` 维护自动分流清单，在 `config/whitelist.txt` 维护
+上游代理授权。命中代理规则但未获白名单批准时拒绝访问，不会退回直连；代理故障时
+也不会自动改变路径。缺少未显式配置的分流文件时使用应用随附的默认清单，升级不覆盖本地文件。
+
+`on` 强制使用代理入口，仍受管理员白名单约束，并清除外部域名的 NO_PROXY 例外；
+本机和私网地址仍保留直接访问。切回 auto 时恢复原有绕过偏好。`off` 清除所有大小写代理变量，并设置
+`NO_PROXY/no_proxy=*`。`restore` 恢复工具接管前的变量，包括用户原先的其他代理配置。
+不带 `--default` 的手动切换只影响当前终端，排障后运行 `auto` 即可恢复分流。
+`exec --auto/--proxy/--direct` 仅改变子进程环境；省略模式时 `exec -- COMMAND` 默认 auto。
+这些命令保留被运行程序的退出状态和信号行为。Git/VS Code 的显式代理设置可能优先于
+环境；`doctor` 会提示检测到的 Git 配置，但不会打印其值或自动修改它。
+
+自动入口使用 HTTP 20811、SOCKS5 20810；强制代理入口保持 HTTP 20809、SOCKS5 20808。
+自动入口的两条路径都检查用户组、认证和审计。其直连路径只允许解析为公共 IP 的目标，
+默认端口为 80/443，可由管理员用 `PTO_AUTH_PROXY_DIRECT_PORTS` 配置；DNS 结果经过检查
+并固定到实际连接的数字地址，阻止经服务账号访问本机、内网、元数据和受保护的上游。
+本机和内网由应用通过 `NO_PROXY` 直接访问，避免借用服务账号权限。
+服务器没有对应的直接网络出口时，直连仍会失败。
 
 `stop` 保存 `~/.config/pto-auth-proxy/authd.stopped` 并停止个人认证服务，
 开机成员启动器和 authd 自身都遵守这个标记。凭据及 shell 偏好保留，`start` 可恢复。
@@ -102,8 +121,8 @@ ps -o user,group,pid,args -C python3 | grep auth_proxy.py
 
 ```text
 应用
- ├── HTTP CONNECT 127.0.0.1:20809
- └── SOCKS5      127.0.0.1:20808
+ ├── 自动 HTTP  127.0.0.1:20811 / SOCKS5 20810
+ └── 强制代理   HTTP 20809 / SOCKS5 20808
                        │
                  pto-auth-proxy
           用户组检查 / 白名单 / 审计
@@ -116,6 +135,9 @@ ps -o user,group,pid,args -C python3 | grep auth_proxy.py
           用户自己的 authd              │
                  │                      ▼
               PAM 验证          后端代理 → Internet
+
+自动入口：匹配 proxy-domains → 白名单检查 → 上游
+          其他公共 HTTP(S) 目标 → 本机直连（仍需认证和审计）
 ```
 
 共享代理以非 root 用户（默认 `pypto`）运行。每个用户的 `authd` 只服务自己的身份：
@@ -147,7 +169,7 @@ PTO_AUTH_PROXY_GUARD_PORTS=
 `pto-auth-proxy-egress-guard.service` 使用 IPv4/IPv6 `iptables owner` 规则保护
 配置项 `PTO_AUTH_PROXY_GUARD_PORTS` 指定的回环上游端口（默认跟随上游端口）：只有
 代理服务账号（默认 `pypto`）能够直接连接这些端口。普通用户
-必须通过认证入口 `20808/20809`，即使属于 `proxyusers` 组也不能绕过认证直连上游。
+必须通过认证入口 `20808/20809` 或自动入口 `20810/20811`，即使属于 `proxyusers` 组也不能绕过认证直连上游。
 守卫服务独立于主代理运行，启动或重载规则不需要重启主代理。它每30秒检查一次规则，
 发现规则被其他服务清空或覆盖时自动恢复；主代理也要求守卫成功启动后才会启动。
 
@@ -176,8 +198,8 @@ Git 操作：
 - `githubassets.com`、`*.githubassets.com`
 - `codeload.github.com`
 
-`ghcr.io`、`github.io` 和 `github.dev` 不属于核心仓库访问，默认不开放。需要时应
-单独评审并加入管理员维护的 `config/whitelist.txt`。
+`ghcr.io`、`github.io` 和 `github.dev` 默认不经上游代理；auto 模式会尝试公共地址直连。
+需要经上游代理时，应评审并加入 `config/whitelist.txt` 和相应的 `proxy-domains.txt`。
 
 交互式端到端测试会实际读取 GitHub 仓库网页、仓库 API 和 raw README，而不只
 检查端口或 HTTP 状态码。
@@ -288,8 +310,8 @@ pto-auth-proxy join
 socket 的重复 daemon。`join` 只要求输入一次密码：PAM 验证成功后，自动生成权限为
 `0600` 的代理令牌和环境文件，并幂等地接入 `.bashrc` 或 `.zshrc`。新版 authd 只
 保存令牌摘要，Linux 密码不会作为长期代理凭据落盘。用户不需要
-手动复制代理变量；新终端会将 HTTP/HTTPS 流量指向认证入口 `20809`，并将
-`ALL_PROXY/all_proxy` 指向认证 SOCKS5 入口 `20808`。已经运行的 VS Code/Codex
+手动复制代理变量；新终端默认指向自动 HTTP 入口 `20811` 和 SOCKS5 入口 `20810`，
+显式保存的 proxy/direct 偏好保留。已经运行的 VS Code/Codex
 不会被重启，需要用户方便时自行 Reload Window。
 
 密码只允许用户在本机交互式终端中输入，不应发送给 AI、写入聊天、命令参数、仓库或

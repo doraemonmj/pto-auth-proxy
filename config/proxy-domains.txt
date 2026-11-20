@@ -1,0 +1,29 @@
+# Auto-mode routing only. Upstream access still requires whitelist.txt approval.
+# Everything else uses authenticated public HTTP(S) direct forwarding.
+
+# OpenAI / Codex / ChatGPT
+openai.com
+*.openai.com
+chatgpt.com
+*.chatgpt.com
+oaistatic.com
+*.oaistatic.com
+oaiusercontent.com
+*.oaiusercontent.com
+
+# Anthropic / Claude
+anthropic.com
+*.anthropic.com
+claude.ai
+*.claude.ai
+claude.com
+*.claude.com
+
+# GitHub web, API, raw, releases, HTTPS Git and assets
+github.com
+*.github.com
+githubusercontent.com
+*.githubusercontent.com
+githubassets.com
+*.githubassets.com
+codeload.github.com

@@ -39,9 +39,10 @@ usage() {
   report DATE               生成 today/yesterday/YYYY-MM-DD 报告
   join                      交互式安装并启动当前用户 authd
   leave                     注销当前用户，撤销凭据并清理 shell 配置
-  on|off [--default]        切换当前 shell；--default 同时保存新终端偏好
+  auto|on|off [--default]   自动分流（默认）/强制代理/强制直连
+  restore                   恢复工具接管前的 shell 环境
   setup-shell               为已有接入安装/更新 shell 控制，不重新认证
-  exec --direct|--proxy -- COMMAND [ARGS]
+  exec [--auto|--direct|--proxy] -- COMMAND [ARGS]
                             只为该命令选择是否使用代理
   start|stop|restart         启停或重启自己的 authd，不操作共享代理
   status                    当前终端、默认偏好及个人接入状态
@@ -82,6 +83,9 @@ load_config() {
     : "${PTO_AUTH_PROXY_LISTEN_HOST:=127.0.0.1}"
     : "${PTO_AUTH_PROXY_SOCKS_PORT:=20808}"
     : "${PTO_AUTH_PROXY_HTTP_PORT:=20809}"
+    : "${PTO_AUTH_PROXY_AUTO_SOCKS_PORT:=20810}"
+    : "${PTO_AUTH_PROXY_AUTO_HTTP_PORT:=20811}"
+    : "${PTO_AUTH_PROXY_DIRECT_PORTS:=80,443}"
     : "${PTO_AUTH_PROXY_UPSTREAM_HOST:=127.0.0.1}"
     : "${PTO_AUTH_PROXY_UPSTREAM_PORT:=}"
     : "${PTO_AUTH_PROXY_GUARD_PORTS:=${PTO_AUTH_PROXY_UPSTREAM_PORT}}"
@@ -157,9 +161,26 @@ validate() {
             return 1
         }
     done
-    [[ "$PTO_AUTH_PROXY_SOCKS_PORT" != "$PTO_AUTH_PROXY_HTTP_PORT" ]] || {
-        echo "SOCKS5 和 HTTP CONNECT 不能使用同一端口" >&2; return 1;
-    }
+    if [[ -n ${PTO_AUTH_PROXY_PROXY_DOMAINS:-} && ! -r "$PTO_AUTH_PROXY_PROXY_DOMAINS" ]]; then
+        echo "无法读取配置的 proxy-domains 文件" >&2; return 1;
+    fi
+    local listener
+    local listeners=("$PTO_AUTH_PROXY_SOCKS_PORT" "$PTO_AUTH_PROXY_HTTP_PORT"
+                     "$PTO_AUTH_PROXY_AUTO_SOCKS_PORT" "$PTO_AUTH_PROXY_AUTO_HTTP_PORT")
+    local -A seen_ports=()
+    for listener in "${listeners[@]}"; do
+        valid_port "$listener" || { echo "入口端口无效" >&2; return 1; }
+        listener=$((10#$listener))
+        { [[ -z ${seen_ports[$listener]:-} ]] && ((listener != 10#$PTO_AUTH_PROXY_UPSTREAM_PORT)); } || {
+            echo "入口端口必须互不相同，且不能与上游端口相同" >&2; return 1;
+        }
+        seen_ports[$listener]=1
+    done
+    IFS=, read -r -a direct_ports <<< "$PTO_AUTH_PROXY_DIRECT_PORTS"
+    ((${#direct_ports[@]})) || { echo "直连端口不能为空" >&2; return 1; }
+    for listener in "${direct_ports[@]}"; do
+        valid_port "$listener" || { echo "直连端口无效" >&2; return 1; }
+    done
     [[ -r "$COMPONENT_DIR/auth_proxy.py" ]] || {
         echo "缺少代理程序: $COMPONENT_DIR/auth_proxy.py" >&2; return 1;
     }
@@ -203,7 +224,7 @@ case "$COMMAND" in
         (($# == 0)) || { usage; exit 2; }
         exec bash "$COMPONENT_DIR/leave-proxy.sh"
         ;;
-    on|off|shell-ready|exec)
+    auto|on|off|restore|shell-ready|exec)
         exec python3 "$COMPONENT_DIR/user_proxy.py" "$COMMAND" "$@"
         ;;
     setup-shell|start|stop|restart)

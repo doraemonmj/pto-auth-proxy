@@ -35,22 +35,44 @@ class UserControlTest(unittest.TestCase):
             self.addCleanup(patch.stop)
         (self.directory / "secret-uri").write_text("private-test-token")
         (self.directory / "endpoints.json").write_text(json.dumps(
-            {"host": "::1", "http_port": 20909, "socks_port": 20908}))
+            {"host": "::1", "http_port": 20909, "socks_port": 20908,
+             "auto_http_port": 20911, "auto_socks_port": 20910}))
 
     def test_proxy_exec_builds_child_environment_without_mutating_parent(self):
         original = {"HTTPS_PROXY": "http://original", "NO_PROXY": "*,internal.example"}
         with mock.patch.dict(os.environ, original, clear=True), \
              mock.patch.object(user_proxy.os, "execvpe", side_effect=SystemExit(42)) as execute:
             with self.assertRaises(SystemExit):
-                user_proxy.exec_command(["--proxy", "--", "program", "arg with spaces"])
+                user_proxy.exec_command(["--auto", "--", "program", "arg with spaces"])
             self.assertEqual(dict(os.environ), original)
         command, args, environment = execute.call_args.args
         self.assertEqual(command, "program")
         self.assertEqual(args, ["program", "arg with spaces"])
-        self.assertEqual(environment["HTTPS_PROXY"], "http://test-user:private-test-token@[::1]:20909")
-        self.assertEqual(environment["all_proxy"], "socks5h://test-user:private-test-token@[::1]:20908")
+        self.assertEqual(environment["HTTPS_PROXY"], "http://test-user:private-test-token@[::1]:20911")
+        self.assertEqual(environment["all_proxy"], "socks5h://test-user:private-test-token@[::1]:20910")
         self.assertNotIn("*", environment["NO_PROXY"].split(","))
         self.assertIn("internal.example", environment["NO_PROXY"].split(","))
+
+    def test_forced_proxy_overrides_existing_external_domain_bypasses(self):
+        environment = user_proxy.proxy_environment({"NO_PROXY": "github.com,*"}, mode="proxy")
+        self.assertNotIn("github.com", environment["NO_PROXY"].split(","))
+        self.assertNotIn("*", environment["NO_PROXY"].split(","))
+        self.assertTrue(environment["HTTPS_PROXY"].endswith("@[::1]:20909"))
+
+    def test_unspecified_exec_mode_is_auto(self):
+        with mock.patch.object(user_proxy.os, "execvpe", side_effect=SystemExit) as execute:
+            with self.assertRaises(SystemExit):
+                user_proxy.exec_command(["--", "program"])
+        environment = execute.call_args.args[2]
+        self.assertTrue(environment["HTTPS_PROXY"].endswith("@[::1]:20911"))
+        self.assertTrue(environment["ALL_PROXY"].endswith("@[::1]:20910"))
+
+    def test_auto_default_and_saved_manual_overrides(self):
+        self.assertEqual(user_proxy.default_mode(), "auto")
+        for command, mode in (("off", "direct"), ("on", "proxy"), ("auto", "auto")):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(user_proxy.main([command, "--default"]), 0)
+            self.assertEqual(user_proxy.default_mode(), mode)
 
     def test_direct_exec_removes_every_proxy_spelling_and_preserves_exit_status(self):
         environment = os.environ.copy()
@@ -260,16 +282,16 @@ export HTTPS_PROXY=''
 export NO_PROXY='custom.example'
 unset ALL_PROXY http_proxy https_proxy all_proxy no_proxy
 source "$HOME/.config/pto-auth-proxy/env.sh"
-[[ "$HTTP_PROXY" == http://testuser:*@127.0.0.1:20809 ]]
+[[ "$HTTP_PROXY" == http://testuser:*@127.0.0.1:20811 ]]
 pto-auth-proxy on
 source "$HOME/.config/pto-auth-proxy/env.sh"
-pto-auth-proxy off
+pto-auth-proxy restore
 [[ "$HTTP_PROXY" == 'http://original.invalid:3128' ]]
 [[ ${HTTPS_PROXY+x} == x && -z "$HTTPS_PROXY" ]]
 [[ "$NO_PROXY" == custom.example ]]
 [[ ${ALL_PROXY+x}${http_proxy+x}${https_proxy+x}${all_proxy+x}${no_proxy+x} == '' ]]
 pto-auth-proxy on
-pto-auth-proxy off
+pto-auth-proxy restore
 [[ "$HTTP_PROXY" == 'http://original.invalid:3128' ]]
 ''')
 
@@ -327,8 +349,45 @@ export NO_PROXY='*,*.internal,*,custom.example,*'
 source "$HOME/.config/pto-auth-proxy/env.sh"
 [[ ",$NO_PROXY," != *',*,'* ]]
 [[ ",$NO_PROXY," == *',*.internal,'* ]]
-pto-auth-proxy off
+pto-auth-proxy restore
 [[ "$NO_PROXY" == '*,*.internal,*,custom.example,*' ]]
+''')
+
+    def test_default_auto_manual_overrides_and_restore(self):
+        self.run_shell('''
+set -eu
+export HTTP_PROXY='http://original.invalid:3128'
+export NO_PROXY='custom.example'
+source "$HOME/.config/pto-auth-proxy/env.sh"
+[[ "$HTTPS_PROXY" == http://testuser:*@127.0.0.1:20811 ]]
+[[ "$ALL_PROXY" == socks5h://testuser:*@127.0.0.1:20810 ]]
+pto-auth-proxy on
+[[ "$HTTPS_PROXY" == http://testuser:*@127.0.0.1:20809 ]]
+[[ ",$NO_PROXY," != *',custom.example,'* ]]
+pto-auth-proxy off
+[[ -z ${HTTP_PROXY+x}${HTTPS_PROXY+x}${ALL_PROXY+x}${http_proxy+x}${https_proxy+x}${all_proxy+x} ]]
+[[ "$NO_PROXY" == '*' && "$no_proxy" == '*' ]]
+pto-auth-proxy auto
+[[ "$HTTPS_PROXY" == http://testuser:*@127.0.0.1:20811 ]]
+[[ ",$NO_PROXY," == *',custom.example,'* ]]
+pto-auth-proxy restore
+[[ "$HTTP_PROXY" == http://original.invalid:3128 ]]
+[[ "$NO_PROXY" == custom.example ]]
+pto-auth-proxy auto --default
+[[ $(cat "$HOME/.config/pto-auth-proxy/default-mode") == auto ]]
+''')
+
+    def test_manual_direct_then_auto_preserves_lowercase_bypass_preferences(self):
+        self.run_shell('''
+set -eu
+unset NO_PROXY
+export no_proxy='lowercase.example'
+source "$HOME/.config/pto-auth-proxy/env.sh"
+pto-auth-proxy off
+pto-auth-proxy auto
+[[ ",$NO_PROXY," == *',lowercase.example,'* ]]
+pto-auth-proxy restore
+[[ -z ${NO_PROXY+x} && "$no_proxy" == lowercase.example ]]
 ''')
 
     def test_switch_does_not_leak_credentials_under_xtrace(self):
@@ -346,7 +405,7 @@ pto-auth-proxy off
 set -eu
 export HTTP_PROXY='http://original.invalid:3128'
 source "$HOME/.config/pto-auth-proxy/env.sh"
-pto-auth-proxy off
+pto-auth-proxy restore
 [[ "$HTTP_PROXY" == 'http://original.invalid:3128' ]]
 pto-auth-proxy on
 pto-auth-proxy off --default

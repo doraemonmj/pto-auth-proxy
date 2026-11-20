@@ -121,6 +121,7 @@ install -d -m 0750 -o "$PROXY_USER" -g "$PROXY_GROUP" \
 
 install_atomic "$PROJECT_DIR/bin/pto-auth-proxy" \
     "$PREFIX/bin/pto-auth-proxy" 0755
+install_atomic "$PROJECT_DIR/config/proxy-domains.txt" "$PREFIX/auth-proxy/proxy-domains.txt" 0644
 install_atomic "$PROJECT_DIR/auth_proxy.py" \
     "$PREFIX/auth-proxy/auth_proxy.py" 0755
 install_atomic "$PROJECT_DIR/authd.py" \
@@ -161,6 +162,8 @@ if [[ ! -L "$BIN_LINK" || $(readlink -- "$BIN_LINK") != "$expected_bin_link" ]];
 fi
 
 if ((INIT_CONFIG)); then
+    [[ -e "$CONFIG_DIR/proxy-domains.txt" ]] ||
+        install -m 0644 "$PROJECT_DIR/config/proxy-domains.txt" "$CONFIG_DIR/proxy-domains.txt"
     [[ -e "$CONFIG_DIR/auth-proxy.env" ]] ||
         install -m 0644 "$PROJECT_DIR/config/auth-proxy.env.example" \
             "$CONFIG_DIR/auth-proxy.env"

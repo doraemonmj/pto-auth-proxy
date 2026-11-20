@@ -55,7 +55,7 @@ def authd_capability(user: str) -> tuple[bool, str]:
     return False, "down"
 
 
-def proxy_url(user: str, host: str, port: int) -> tuple[str | None, str]:
+def proxy_url(user: str, host: str, port: int, auto_port: int | None = None) -> tuple[str | None, str]:
     for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
         value = os.environ.get(name, "")
         try:
@@ -64,7 +64,7 @@ def proxy_url(user: str, host: str, port: int) -> tuple[str | None, str]:
         except ValueError:
             continue
         if parsed.scheme == "http" \
-                and parsed.hostname in {host, "localhost"} and parsed.port == port \
+                and parsed.hostname in {host, "localhost"} and parsed.port in {port, auto_port} \
                 and parsed.username and parsed.password and unquote(parsed.username) == user:
             return value, "env"
 
@@ -75,6 +75,12 @@ def proxy_url(user: str, host: str, port: int) -> tuple[str | None, str]:
         config_home / "pto-auth-proxy" / "secret-uri",
         Path.home() / ".proxy-secret-uri",
     ]
+    try:
+        preferred = user_proxy.default_mode()
+    except (OSError, ValueError):
+        preferred = "auto"
+    if auto_port is not None and preferred != "proxy":
+        port = auto_port
     url_host = f"[{host}]" if ":" in host else host
     for secret_file in candidates:
         try:
@@ -158,7 +164,7 @@ def access_disabled() -> bool:
     return (user_proxy.access_dir() / "access.disabled").exists()
 
 
-def shell_mode(host: str, http_port: int, socks_port: int) -> str:
+def shell_mode(host: str, http_port: int, socks_port: int, auto_http_port: int = 20811, auto_socks_port: int = 20810) -> str:
     present = [key for key in user_proxy.PROXY_KEYS if os.environ.get(key)]
     if not present:
         return "direct"
@@ -168,15 +174,19 @@ def shell_mode(host: str, http_port: int, socks_port: int) -> str:
             url = urlsplit(os.environ[key])
             expected_port = socks_port if key.lower() == "all_proxy" else http_port
             expected_scheme = "socks5h" if key.lower() == "all_proxy" else "http"
-            ours.append(url.hostname in {host, "localhost"} and url.port == expected_port
-                        and url.scheme == expected_scheme and url.username is not None)
+            auto_port = auto_socks_port if key.lower() == "all_proxy" else auto_http_port
+            matches = url.hostname in {host, "localhost"} and url.scheme == expected_scheme and url.username is not None
+            ours.append(("auto" if url.port == auto_port else "proxy" if url.port == expected_port else "external")
+                        if matches else "external")
         except ValueError:
-            ours.append(False)
-    if not any(ours):
+            ours.append("external")
+    if all(mode == "external" for mode in ours):
         return "external"
     if any("*" in os.environ.get(key, "").split(",") for key in ("NO_PROXY", "no_proxy")):
         return "bypassed"
-    return "proxy" if all(ours) and len(present) == len(user_proxy.PROXY_KEYS) else "mixed"
+    if len(present) == len(user_proxy.PROXY_KEYS) and len(set(ours)) == 1:
+        return ours[0]
+    return "mixed"
 
 
 def https_probe(url: str) -> str:
@@ -237,8 +247,10 @@ def main(command: str = "status") -> int:
     stopped = (user_proxy.access_dir() / "authd.stopped").exists()
     member_ok = group_member(user, group_name)
     authd_ok, authd_mode = authd_capability(user)
-    url, config_source = proxy_url(user, host, port)
-    mode = shell_mode(host, port, socks_port)
+    auto_http_port = int(os.environ.get("PTO_AUTH_PROXY_AUTO_HTTP_PORT", "20811"))
+    auto_socks_port = int(os.environ.get("PTO_AUTH_PROXY_AUTO_SOCKS_PORT", "20810"))
+    url, config_source = proxy_url(user, host, port, auto_http_port)
+    mode = shell_mode(host, port, socks_port, auto_http_port, auto_socks_port)
     try:
         default = user_proxy.default_mode()
     except (OSError, ValueError):

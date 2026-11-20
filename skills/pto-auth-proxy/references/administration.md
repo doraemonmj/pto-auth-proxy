@@ -124,5 +124,32 @@ The authd unit's ExecCondition and boot member starter honor the account-home
 `authd.stopped` marker. Do not remove it during upgrades. A local `start` or
 explicit re-onboarding clears it; only successful PAM re-onboarding clears
 `access.disabled`. Existing shell hooks can be upgraded with `setup-shell`
-without issuing new tokens. Fresh `join` keeps the historical proxy-on default;
+without issuing new tokens. Fresh `join` and users without a saved preference use auto;
 an explicitly saved `default-mode` is preserved by both join and setup-shell.
+
+
+## Automatic routing
+
+`config/proxy-domains.txt` selects destinations sent to the SOCKS upstream;
+`config/whitelist.txt` independently authorizes upstream use. Selected domains
+missing from the whitelist fail closed, without direct fallback. SIGHUP reloads
+both files. Keep provider API/login/asset domains narrow and review deliberate
+changes. Defaults include the existing OpenAI, Claude and core GitHub host sets;
+optional Google/npm whitelist entries do not automatically become proxy routes.
+
+Auto listeners default to HTTP 20811 and SOCKS5 20810; forced proxy listeners
+remain 20809/20808. Validate all four ports for collisions before shadow testing.
+The auto direct path authenticates, resolves and checks all DNS results, and
+connects only to checked numeric public addresses. It rejects private, loopback,
+link-local and multicast destinations, and only permits DIRECT_PORTS (80,443 by
+default). Keep the egress guard enabled: direct forwarding is not an upstream
+bypass. Local/internal traffic should use application NO_PROXY under the user's
+own identity. A routing selection never grants general service-owner access.
+
+`--init-config` creates a routing file only if missing; upgrades preserve it.
+An upgrade without a routing file uses the shipped defaults. An explicitly
+configured missing routing file is an error rather than a silently different
+policy. Update existing shell hooks with setup-shell without rotating credentials.
+`off` now means forced direct; use restore for the former environment-restore
+operation. Explicit saved proxy/direct defaults are kept; absent preference means
+auto. No service is automatically restarted to apply these changes.

@@ -50,9 +50,9 @@ def default_mode() -> str:
     try:
         mode = (config_dir() / "default-mode").read_text().strip()
     except FileNotFoundError:
-        return "proxy"  # Preserve existing join behavior on upgrade.
-    if mode not in {"proxy", "direct"}:
-        raise ValueError("invalid default-mode; use on --default or off --default")
+        return "auto"  # Explicit saved proxy/direct preferences remain unchanged.
+    if mode not in {"auto", "proxy", "direct"}:
+        raise ValueError("invalid default-mode; use auto/on/off --default")
     return mode
 
 
@@ -70,13 +70,13 @@ def credential() -> str:
     return secret
 
 
-def proxy_environment(environment: dict[str, str]) -> dict[str, str]:
+def proxy_environment(environment: dict[str, str], mode: str = "proxy") -> dict[str, str]:
     secret = credential()
     try:
         endpoints = json.loads((config_dir() / "endpoints.json").read_text())
         host = endpoints["host"]
-        http_port = int(endpoints["http_port"])
-        socks_port = int(endpoints["socks_port"])
+        http_port = int(endpoints["auto_http_port" if mode == "auto" else "http_port"])
+        socks_port = int(endpoints["auto_socks_port" if mode == "auto" else "socks_port"])
         if not isinstance(host, str) or not host or any(c in host for c in "/@\r\n"):
             raise ValueError
         if not (1 <= http_port <= 65535 and 1 <= socks_port <= 65535):
@@ -89,8 +89,9 @@ def proxy_environment(environment: dict[str, str]) -> dict[str, str]:
     for name in PROXY_KEYS:
         scheme, port = ("socks5h", socks_port) if name.lower() == "all_proxy" else ("http", http_port)
         result[name] = f"{scheme}://{user}:{secret}@{host}:{port}"
-    bypass = [value for value in result.get("NO_PROXY", result.get("no_proxy", "")).split(",") if value and value != "*"]
-    for value in ("localhost", "127.0.0.0/8", "::1", "169.254.169.254", "192.168.0.0/16", "10.0.0.0/8"):
+    bypass = ([value for value in result.get("NO_PROXY", result.get("no_proxy", "")).split(",")
+               if value and value != "*"] if mode == "auto" else [])
+    for value in ("localhost", "127.0.0.1", "127.0.0.0/8", "::1", "169.254.169.254", "192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"):
         if value not in bypass:
             bypass.append(value)
     result["NO_PROXY"] = result["no_proxy"] = ",".join(bypass)
@@ -98,15 +99,17 @@ def proxy_environment(environment: dict[str, str]) -> dict[str, str]:
 
 
 def exec_command(args: list[str]) -> int:
-    if len(args) < 3 or args[0] not in {"--direct", "--proxy"} or args[1] != "--":
-        raise ValueError("usage: pto-auth-proxy exec --direct|--proxy -- COMMAND [ARGS]")
+    if args and args[0] == "--":
+        args = ["--auto", *args]
+    if len(args) < 3 or args[0] not in {"--auto", "--direct", "--proxy"} or args[1] != "--":
+        raise ValueError("usage: pto-auth-proxy exec [--auto|--direct|--proxy] -- COMMAND [ARGS]")
     environment = os.environ.copy()
     if args[0] == "--direct":
         for name in PROXY_KEYS:
             environment.pop(name, None)
         environment["NO_PROXY"] = environment["no_proxy"] = "*"
     else:
-        environment = proxy_environment(environment)
+        environment = proxy_environment(environment, mode=args[0][2:])
     try:
         os.execvpe(args[2], args[2:], environment)
     except FileNotFoundError:
@@ -296,14 +299,17 @@ def main(args: list[str] | None = None) -> int:
         if command == "shell-ready" and not rest:
             credential()
             return 0
-        if command in {"on", "off"}:
+        if command == "restore" and not rest:
+            raise ValueError("restore requires shell integration; source your env.sh")
+        if command in {"auto", "on", "off"}:
             if rest not in ([], ["--default"]):
                 raise ValueError(f"usage: pto-auth-proxy {command} [--default]")
-            if command == "on":
+            if command in {"auto", "on"}:
                 credential()
             if rest:
-                atomic_write(config_dir() / "default-mode", "proxy\n" if command == "on" else "direct\n")
-                print(f"Future shells: {'proxy' if command == 'on' else 'direct'}.")
+                mode = {"auto": "auto", "on": "proxy", "off": "direct"}[command]
+                atomic_write(config_dir() / "default-mode", mode + "\n")
+                print(f"Future shells: {mode}.")
                 print("This process cannot change the parent shell; run setup-shell, then source your env.sh.")
                 return 0
             raise ValueError("shell integration is not loaded; run pto-auth-proxy setup-shell, then source "

@@ -246,11 +246,11 @@ second_hash=$(sha256sum "$SHELL_HOME/.bashrc" | cut -d' ' -f1)
 HOME="$SHELL_HOME" bash --noprofile --norc -c '
     export NO_PROXY=custom.example
     source "$HOME/.bashrc"
-    [[ "$HTTP_PROXY" == http://testuser:*@127.0.0.1:20809 ]]
+    [[ "$HTTP_PROXY" == http://testuser:*@127.0.0.1:20811 ]]
     [[ "$HTTPS_PROXY" == "$HTTP_PROXY" ]]
     [[ "$http_proxy" == "$HTTP_PROXY" ]]
     [[ "$https_proxy" == "$HTTP_PROXY" ]]
-    [[ "$ALL_PROXY" == socks5h://testuser:*@127.0.0.1:20808 ]]
+    [[ "$ALL_PROXY" == socks5h://testuser:*@127.0.0.1:20810 ]]
     [[ "$all_proxy" == "$ALL_PROXY" ]]
     [[ ",$NO_PROXY," == *,custom.example,* ]]
     [[ ",$NO_PROXY," == *,localhost,* ]]

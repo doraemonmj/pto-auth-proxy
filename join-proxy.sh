@@ -281,7 +281,7 @@ else
 fi
 unset AUTH_MODE
 
-pass "future shells are configured for authenticated proxy port ${PTO_AUTH_PROXY_HTTP_PORT:-20809}"
+pass "future shells default to auto routing unless a manual preference was saved"
 
 echo
 echo "All set."
@@ -300,7 +300,7 @@ else
 fi
 echo "  - proxy environment: ${XDG_CONFIG_HOME:-$HOME/.config}/pto-auth-proxy/env.sh"
 echo '  - enable shell controls now: source "${XDG_CONFIG_HOME:-$HOME/.config}/pto-auth-proxy/env.sh"'
-echo "  - or open a new terminal; use pto-auth-proxy on/off to switch later"
+echo "  - or open a new terminal; use pto-auth-proxy auto/on/off to switch later"
 echo "  - VS Code / Codex already running must use Reload Window when convenient"
 echo "  - no running process was restarted by join"
 echo
