@@ -39,7 +39,13 @@ usage() {
   report DATE               生成 today/yesterday/YYYY-MM-DD 报告
   join                      交互式安装并启动当前用户 authd
   leave                     注销当前用户，撤销凭据并清理 shell 配置
-  status                    一行检查组、authd、凭据、20809 和直连隔离
+  on|off [--default]        切换当前 shell；--default 同时保存新终端偏好
+  setup-shell               为已有接入安装/更新 shell 控制，不重新认证
+  exec --direct|--proxy -- COMMAND [ARGS]
+                            只为该命令选择是否使用代理
+  start|stop|restart         启停或重启自己的 authd，不操作共享代理
+  status                    当前终端、默认偏好及个人接入状态
+  doctor                    深入检查认证链路、上游、守卫和应用配置
   test                      交互式端到端测试（含 GitHub 内容读取）
 EOF
 }
@@ -197,10 +203,20 @@ case "$COMMAND" in
         (($# == 0)) || { usage; exit 2; }
         exec bash "$COMPONENT_DIR/leave-proxy.sh"
         ;;
-    status)
+    on|off|shell-ready|exec)
+        exec python3 "$COMPONENT_DIR/user_proxy.py" "$COMMAND" "$@"
+        ;;
+    setup-shell|start|stop|restart)
+        export PTO_AUTH_PROXY_TOOL_DIR=$TOOL_DIR
         (($# == 0)) || { usage; exit 2; }
         load_config
-        exec python3 "$COMPONENT_DIR/status_proxy.py"
+        exec python3 "$COMPONENT_DIR/user_proxy.py" "$COMMAND"
+        ;;
+    status|doctor)
+        export PTO_AUTH_PROXY_TOOL_DIR=$TOOL_DIR
+        (($# == 0)) || { usage; exit 2; }
+        load_config
+        exec python3 "$COMPONENT_DIR/status_proxy.py" "$COMMAND"
         ;;
     test)
         (($# == 0)) || { usage; exit 2; }

@@ -30,6 +30,7 @@ SRC_DIR=${PTO_AUTH_PROXY_SOURCE_DIR:-$SCRIPT_DIR}
 BIN_DIR=$HOME/.local/bin
 LOG_FILE=$HOME/.local/authproxy-authd.log
 DISABLED_FILE=$HOME/.config/pto-auth-proxy/access.disabled
+STOPPED_FILE=$HOME/.config/pto-auth-proxy/authd.stopped
 PROXY_OWNER=${PTO_AUTH_PROXY_OWNER:-pypto}
 PROXY_GROUP=${PTO_AUTH_PROXY_GROUP:-proxyusers}
 PAM_SERVICE=${PTO_AUTH_PROXY_PAM_SERVICE:-sshd}
@@ -42,15 +43,16 @@ fi
 SYSTEMD_MANAGED=0
 SYSTEMD_BOOT_ENABLED=0
 
-# Treat an enabled or already-active system instance as authoritative. Merely
-# installing the template is not enough: an unenabled instance would not
-# return after reboot, so join keeps the compatibility watchdog in that case.
+# An installed system template is authoritative even while the user stopped
+# its instance. Do not create a competing home watchdog; boot persistence is
+# supplied by the member starter or an explicitly enabled individual instance.
 if command -v systemctl >/dev/null 2>&1; then
   SYSTEMD_UNIT_STATE=$(systemctl is-enabled "$SYSTEMD_UNIT" 2>/dev/null || true)
   if [ "$SYSTEMD_UNIT_STATE" = enabled ]; then
     SYSTEMD_BOOT_ENABLED=1
   fi
-  if systemctl is-active --quiet "$SYSTEMD_UNIT" 2>/dev/null \
+  if [ "$(systemctl show --property=LoadState --value "$SYSTEMD_UNIT" 2>/dev/null)" = loaded ] \
+     || systemctl is-active --quiet "$SYSTEMD_UNIT" 2>/dev/null \
      || [ "$SYSTEMD_UNIT_STATE" = enabled ] \
      || [ "$SYSTEMD_UNIT_STATE" = enabled-runtime ]; then
     SYSTEMD_MANAGED=1
@@ -91,9 +93,13 @@ else
   exit 1
 fi
 
+# join is explicit re-onboarding; it may resume a previously stopped authd.
+# The access.disabled marker remains until PAM verification succeeds.
+rm -f -- "$STOPPED_FILE"
+
 if [ "$SYSTEMD_MANAGED" -eq 1 ]; then
   header "Step 3: systemd-managed authd"
-  pass "$SYSTEMD_UNIT is enabled or active"
+  pass "$SYSTEMD_UNIT is installed and managed by systemd"
   info "Using the shared deployed authd; no per-home copy is needed."
 else
   header "Step 3: install compatibility authd into your home"
@@ -113,7 +119,7 @@ else
 LOG="${HOME}/.local/authproxy-authd.log"
 BIN="${HOME}/.local/bin/authproxy-authd.py"
 echo "$(date '+%F %T') watchdog started (pid=$$)" >> "$LOG"
-while true; do
+while [ ! -e "$HOME/.config/pto-auth-proxy/authd.stopped" ]; do
   python3 "$BIN" >> "$LOG" 2>&1
   rc=$?
   echo "$(date '+%F %T') authd exited rc=$rc, restarting in 3s" >> "$LOG"
@@ -152,11 +158,9 @@ if [ "$SYSTEMD_MANAGED" -eq 1 ]; then
     exit 1
   fi
 
-  # The system unit runs the shared authd.py path, so these patterns select
-  # only the old per-home fallback and cannot kill the systemd MainPID. Do
-  # this only after systemd is healthy, preserving the fallback on failures.
-  pkill -u "$ME" -f authproxy-watchdog.sh 2>/dev/null || true
-  pkill -u "$ME" -f authproxy-authd.py 2>/dev/null || true
+  # Select only exact legacy script arguments; preserve systemd and unrelated
+  # user processes. Clean up only after systemd is healthy.
+  python3 "$SRC_DIR/user_proxy.py" stop-compatibility || exit 1
   if [ "$SYSTEMD_BOOT_ENABLED" -eq 1 ]; then
     pass "$SYSTEMD_UNIT is active and enabled for server reboot"
   else
@@ -166,8 +170,7 @@ if [ "$SYSTEMD_MANAGED" -eq 1 ]; then
   fi
 else
   header "Step 4: (re)start compatibility authd via watchdog"
-  pkill -u "$ME" -f authproxy-watchdog.sh 2>/dev/null || true
-  pkill -u "$ME" -f authproxy-authd.py 2>/dev/null || true
+  python3 "$SRC_DIR/user_proxy.py" stop-compatibility || exit 1
   sleep 0.5
   rm -f "$SOCK" 2>/dev/null || true
 
@@ -296,7 +299,8 @@ else
   echo "      sudo systemctl enable --now $SYSTEMD_UNIT"
 fi
 echo "  - proxy environment: ${XDG_CONFIG_HOME:-$HOME/.config}/pto-auth-proxy/env.sh"
-echo "  - open a new terminal to inherit it"
+echo '  - enable shell controls now: source "${XDG_CONFIG_HOME:-$HOME/.config}/pto-auth-proxy/env.sh"'
+echo "  - or open a new terminal; use pto-auth-proxy on/off to switch later"
 echo "  - VS Code / Codex already running must use Reload Window when convenient"
 echo "  - no running process was restarted by join"
 echo

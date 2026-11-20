@@ -16,6 +16,7 @@ INSTALL_SERVICE=0
 ENABLE_SERVICE=0
 INSTALL_UPDATER=0
 ENABLE_UPDATER=0
+INSTALL_USER_CONTROLS=0
 PROXY_USER=pypto
 PROXY_GROUP=proxyusers
 INSTALL_TEMP_FILES=()
@@ -40,6 +41,11 @@ while (($#)); do
         --prefix) PREFIX=$2; shift 2 ;;
         --init-config) INIT_CONFIG=1; shift ;;
         --install-service) INSTALL_SERVICE=1; shift ;;
+        --install-user-controls)
+            INSTALL_SERVICE=1
+            INSTALL_USER_CONTROLS=1
+            shift
+            ;;
         --enable-service)
             INSTALL_SERVICE=1
             ENABLE_SERVICE=1
@@ -62,6 +68,7 @@ while (($#)); do
   --init-config          首次创建配置和白名单（已有文件不覆盖）
   --install-service      安装主代理、守卫及 authd unit，但不 enable/start/restart
   --enable-service       安装并启用全部开机服务，但不立即启动任何服务
+  --install-user-controls 安装 unit 和 polkit 规则，允许组成员启停自己的 authd
   --install-updater      安装独立更新服务和 timer，但不启用
   --enable-updater       安装并启用更新轮询 timer（不会重启代理）
   --proxy-user USER      服务用户，默认 pypto
@@ -87,6 +94,14 @@ getent group "$PROXY_GROUP" >/dev/null 2>&1 || {
     echo "服务用户组不存在: $PROXY_GROUP" >&2
     exit 1
 }
+if ((INSTALL_USER_CONTROLS)); then
+    [[ "$PROXY_GROUP" =~ ^[a-zA-Z0-9_.-]+$ ]] || {
+        echo "用户控制规则不支持此组名" >&2; exit 1;
+    }
+    command -v pkaction >/dev/null 2>&1 || {
+        echo "请先安装 polkit，再安装用户控制规则" >&2; exit 1;
+    }
+fi
 
 install_atomic() {
     local source=$1 destination=$2 mode=$3 temporary
@@ -99,6 +114,7 @@ install_atomic() {
 
 install -d -m 0755 "$PREFIX/bin" "$PREFIX/auth-proxy" \
     "$PREFIX/lib/repo-auto-update" \
+    "$PREFIX/skills/pto-auth-proxy/references" \
     "$CONFIG_DIR" "$TMP_DIR"
 install -d -m 0750 -o "$PROXY_USER" -g "$PROXY_GROUP" \
     "$STATE_DIR" "$STATE_DIR/reports" "$LOG_DIR"
@@ -117,6 +133,14 @@ install_atomic "$PROJECT_DIR/configure-shell.sh" \
     "$PREFIX/auth-proxy/configure-shell.sh" 0755
 install_atomic "$PROJECT_DIR/status_proxy.py" \
     "$PREFIX/auth-proxy/status_proxy.py" 0755
+install_atomic "$PROJECT_DIR/user_proxy.py" \
+    "$PREFIX/auth-proxy/user_proxy.py" 0755
+install_atomic "$PROJECT_DIR/shell-integration.sh" \
+    "$PREFIX/auth-proxy/shell-integration.sh" 0644
+install_atomic "$PROJECT_DIR/skills/pto-auth-proxy/SKILL.md" \
+    "$PREFIX/skills/pto-auth-proxy/SKILL.md" 0644
+install_atomic "$PROJECT_DIR/skills/pto-auth-proxy/references/administration.md" \
+    "$PREFIX/skills/pto-auth-proxy/references/administration.md" 0644
 install_atomic "$PROJECT_DIR/test_proxy.sh" \
     "$PREFIX/auth-proxy/test_proxy.sh" 0755
 install_atomic "$PROJECT_DIR/scripts/egress-guard.sh" \
@@ -186,6 +210,16 @@ if ((INSTALL_SERVICE)); then
     else
         echo "已安装主代理、守卫、成员启动器及 authd 模板；未启用、未启动"
     fi
+fi
+
+if ((INSTALL_USER_CONTROLS)); then
+    policy_tmp=$(mktemp /tmp/pto-auth-proxy-polkit.XXXXXX)
+    INSTALL_TEMP_FILES+=("$policy_tmp")
+    sed "s|@PROXY_GROUP@|$PROXY_GROUP|g" \
+        "$PROJECT_DIR/config/50-pto-auth-proxy-self.rules.in" >"$policy_tmp"
+    install -d -m 0755 /etc/polkit-1/rules.d
+    install_atomic "$policy_tmp" /etc/polkit-1/rules.d/50-pto-auth-proxy-self.rules 0644
+    echo "已授权 $PROXY_GROUP 成员启停自己的 authd；未启动或重启服务"
 fi
 
 if ((INSTALL_UPDATER)); then

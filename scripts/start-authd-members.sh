@@ -57,6 +57,11 @@ while IFS= read -r user; do
     # reach the socket but cannot pre-create or replace another user's path.
     install -d -m 0750 -o "$user" -g "$PROXY_GROUP" \
         "/run/pto-auth-proxy/$user_uid"
+    user_home=$(getent passwd "$user" | cut -d: -f6)
+    if [[ -e "$user_home/.config/pto-auth-proxy/authd.stopped" ]]; then
+        echo "Skipping $user: authd was stopped by the user"
+        continue
+    fi
     unit=$(systemd-escape --template=pto-auth-proxy-authd@.service "$user")
     if systemctl start "$unit"; then
         echo "Started $unit"

@@ -70,6 +70,21 @@ class ProxyTokenTest(unittest.TestCase):
 
 
 class CredentialFallbackTest(unittest.IsolatedAsyncioTestCase):
+    async def test_persistent_stop_denies_token_and_password_even_in_running_daemon(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "authd.stopped"
+            marker.touch()
+            with mock.patch.object(authd, "_access_disabled", return_value=False), \
+                 mock.patch.object(authd, "_STOPPED_FILE", str(marker)), \
+                 mock.patch.object(authd, "_token_matches") as token_matches, \
+                 mock.patch.object(authd, "_pam_call_async") as pam_call:
+                for credential in ("password", "pto_" + "A" * authd._TOKEN_BODY_LENGTH):
+                    reply, via = await authd._authenticate("alice", credential)
+                    self.assertFalse(reply["ok"])
+                    self.assertEqual(via, "disabled")
+                token_matches.assert_not_called()
+                pam_call.assert_not_called()
+
     async def test_disabled_access_never_calls_token_or_pam(self):
         with mock.patch.object(authd, "_access_disabled", return_value=True), \
              mock.patch.object(authd, "_token_matches") as token_matches, \

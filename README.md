@@ -3,6 +3,57 @@
 面向共享 Linux 服务器的认证出口代理。它在本机提供 SOCKS5 和 HTTP CONNECT
 入口，使用每位用户自己的 PAM `authd` 鉴权，并通过域名白名单限制外部访问。
 
+## 日常使用
+
+```bash
+pto-auth-proxy status                        # 当前进程环境、默认偏好和个人 authd
+pto-auth-proxy doctor                        # 主动检查认证、上游、HTTPS 和出口守卫
+pto-auth-proxy on                            # 当前终端使用代理
+pto-auth-proxy off                           # 恢复原有代理环境，保留凭据和服务
+pto-auth-proxy off --default                 # 同时让新终端默认不用 PTO 代理
+pto-auth-proxy on --default                  # 同时让新终端默认使用 PTO 代理
+pto-auth-proxy exec --direct -- curl https://example.com
+pto-auth-proxy exec --proxy -- git fetch
+pto-auth-proxy stop                          # 停止自己的 authd，跨重启保留停用状态
+pto-auth-proxy start                         # 恢复自己的 authd，无需重新输入密码
+pto-auth-proxy restart                       # 只重启自己的 authd，不轮换 token
+```
+
+`on/off` 依赖 Bash/Zsh shell 函数，才能立即改变当前终端。新接入的 `join` 会安装它；
+已有接入升级时无需重新认证，运行下面两条命令即可：
+
+```bash
+pto-auth-proxy setup-shell
+source "${XDG_CONFIG_HOME:-$HOME/.config}/pto-auth-proxy/env.sh"
+```
+
+`off` 恢复启用前的环境，原来配置了其他代理时会恢复该代理；只想让单个命令直连时，
+使用 `exec --direct`。它删除子进程中的大小写 HTTP/HTTPS/ALL_PROXY，并设置
+`NO_PROXY/no_proxy=*`。`exec --proxy` 临时注入认证代理环境，不改变当前终端或默认偏好。
+这两个命令保留被运行程序的退出状态和信号行为。Git/VS Code 等应用显式设置的代理
+可能优先于环境，`doctor` 会提示检测到的 Git 配置，但不会打印其值或自动修改它。
+服务器没有直接出口时，关闭代理不会让直连变得可用；工具不会自动切换到直连。
+
+`stop` 保存 `~/.config/pto-auth-proxy/authd.stopped` 并停止个人认证服务，
+开机成员启动器和 authd 自身都遵守这个标记。凭据及 shell 偏好保留，`start` 可恢复。
+`start/restart` 不清除 `leave` 的注销状态；注销后需要本地交互运行 `join`。
+`stop/leave` 都只拒绝新认证，已建立的业务连接继续；强制断开个人连接和委托重启共享
+代理尚未提供。当前终端的切换也不影响其他终端、已经运行的 VS Code/Codex 或服务。
+
+个人 systemd 控制需管理员一次性显式安装：
+
+```bash
+sudo ./scripts/install.sh --install-user-controls
+```
+
+该选项安装 authd unit 和受限 polkit 规则，不启动、不重启服务。规则允许配置组成员
+在 SSH 会话中启停自己的 authd，不授权其他用户实例、共享代理、出口守卫、unit 编辑
+或开机启用操作。普通安装及自动更新不会新增这项授权；旧 watchdog 模式保持兼容。
+
+AI 使用入口为 [skills/pto-auth-proxy/SKILL.md](skills/pto-auth-proxy/SKILL.md)，
+仓库 `AGENTS.md` 会引导 AI 先读它。正式安装也将 skill 和管理员参考文档放在
+`app/skills/pto-auth-proxy/`。将该目录加入所用 AI 的 skill 搜索路径即可发现。
+
 ## ⚠️ 重要启动要求
 
 Auth Proxy 主进程必须以配置中的 `PTO_AUTH_PROXY_OWNER` 用户运行（默认
@@ -110,7 +161,7 @@ PTO_AUTH_PROXY_GUARD_PORTS=
   `/tmp/authproxy-<user>.sock`。
 - `pto-auth-proxy join` 会优先复用已启用或运行中的 systemd 实例，并只清理旧版的
   per-home watchdog，不会启动第二个 authd；因此用户仍可安全地手动执行 `join`。
-- 当前尚无 systemd 实例时，`join` 保留 `setsid + nohup` watchdog 作为首次接入的
+- 尚未安装 systemd 模板时，`join` 保留 `setsid + nohup` watchdog 作为首次接入的
   兼容回退；下次服务器启动会自动切换为系统级实例，之后不需要重新 `join`。
 - 新增或移除组成员会在下次开机自动反映。管理员若希望立即切换，可单独启动对应模板
   实例，不需要重启共享代理。
@@ -211,7 +262,7 @@ sudo systemctl start pto-auth-proxy
 配置示例见 `config/auth-proxy.env.example`。不得将密码、token、私钥或
 `~/.proxy-secret*` 写入工具配置或 Git。
 
-常用只读命令：
+常用只读命令（`doctor` 会发起短连接检查）：
 
 ```bash
 pto-auth-proxy validate
@@ -232,7 +283,7 @@ pto-auth-proxy status
 pto-auth-proxy join
 ```
 
-如果管理员已启用该用户的 systemd 实例，`join` 会复用它并进行交互式验证；否则会
+如果管理员已安装 systemd 模板，`join` 会复用该用户实例并进行交互式验证；否则会
 安装并重启兼容 watchdog。因此该命令不是只读操作，但在两种模式间不会创建互相抢占
 socket 的重复 daemon。`join` 只要求输入一次密码：PAM 验证成功后，自动生成权限为
 `0600` 的代理令牌和环境文件，并幂等地接入 `.bashrc` 或 `.zshrc`。新版 authd 只
@@ -245,8 +296,9 @@ socket 的重复 daemon。`join` 只要求输入一次密码：PAM 验证成功�
 共享日志。shell rc 只包含对环境文件的引用，不包含代理凭据。令牌轮换时旧令牌有
 10 分钟宽限，避免正在运行的工具突然断线。
 
-日常自检只需运行 `pto-auth-proxy status`。它会用一行结果检查组成员、authd、凭据、
-`20809` 认证链路、守卫服务以及配置上游的直连隔离，并输出 `upstream=主机:端口`，不会打印凭据。
+日常查看运行 `pto-auth-proxy status`，它区分当前进程环境、新终端默认偏好、个人
+接入和 authd 状态，不连接外部站点。排查网络运行 `pto-auth-proxy doctor`，主动检查
+认证 CONNECT、验证证书的 HTTPS 请求、守卫服务以及配置上游的直连隔离，并输出 `upstream=主机:端口`，不会打印凭据。
 该地址来自本地配置；改配置后还需重启主代理才能生效，排查时应核对最近启动日志中的 `upstream`。主代理对客户
 端握手、上游连接、上游握手、半关闭收尾和关闭阶段均设有本机超时；上游异常时会快速失败并回收
 双向转发任务，不会长期积累挂起连接。
@@ -337,7 +389,9 @@ skills/pto-auth-proxy/SKILL.md     # 仓库级 AI Skill
 tests/                             # 可重复自动测试
 auth_proxy.py                      # SOCKS5 / HTTP CONNECT 主进程
 authd.py                           # 每用户 PAM 认证进程
-status_proxy.py                    # 一行式用户就绪检查
+status_proxy.py                    # 进程环境状态和主动链路诊断
+user_proxy.py                      # 单命令环境、个人服务控制及 shell 升级
+shell-integration.sh               # Bash/Zsh 即时开关和环境恢复
 join-proxy.sh                      # 交互式用户接入
 leave-proxy.sh                     # 用户注销、token 撤销与 shell 清理
 configure-shell.sh                 # 幂等生成用户代理环境

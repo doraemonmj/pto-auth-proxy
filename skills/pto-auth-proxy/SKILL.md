@@ -1,209 +1,90 @@
 ---
 name: pto-auth-proxy
-description: Inspect, validate, configure, test, and operate the pto-auth-proxy authenticated whitelist proxy on shared Linux servers.
+description: Use and diagnose pto-auth-proxy on shared Linux hosts, including temporary proxy selection, current-user authd lifecycle, onboarding and logout. Use for this tool's commands and proxy failures; read the administration reference for deployment changes.
 ---
 
 # pto-auth-proxy
 
-Use the public `pto-auth-proxy` command. Keep read-only diagnosis, configuration
-changes, user onboarding, and production service operations clearly separated.
+Check `pto-auth-proxy --help` when the installed version is uncertain. If it
+lacks `on/off`, `exec`, `setup-shell` or `doctor`, these controls are not deployed
+yet; report that fact instead of claiming they work or upgrading the service
+without deployment intent. Older `status` actively probes connectivity and does
+not distinguish shell mode. Keep onboarding and logout explicit on old versions.
 
-## Safety boundaries
+For a current installation, start with `pto-auth-proxy status`. It reports the current process environment,
+new-shell default, enrollment and personal authd separately. `shell=direct`
+is a valid user choice; it does not mean the proxy is broken. Run
+`pto-auth-proxy doctor` when diagnosing connectivity: it actively checks
+CONNECT, verified HTTPS, the guard and the configured upstream.
 
-- Never ask a user to paste or reveal a Linux password, proxy password, token,
-  private key, `.proxy-secret*`, or expanded proxy URL.
-- Never print `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, process environments, or
-  shell configuration without redacting credentials.
-- Never write credentials into this repository, `auth-proxy.env`, service units,
-  logs, reports, command arguments, or chat.
-- `validate`, `traffic`, `status`, log inspection, socket inspection, and
-  configuration review are read-only. `status` opens only short diagnostic
-  connections and never prints credentials.
-- `join` reuses an enabled system authd instance, or installs and restarts the
-  current user's compatibility watchdog when no instance is enabled. Run it
-  only when the user explicitly requests onboarding, verification, or repair.
-- `leave` revokes the current user's proxy tokens, persists a deny marker,
-  removes generated shell configuration, and stops only the legacy per-home
-  watchdog. Run it only when the user explicitly requests proxy logout.
-- Editing the whitelist, signaling the proxy, installing a unit, and starting,
-  stopping, restarting, enabling, or disabling a service are state-changing
-  administrator operations. Require explicit user intent for the exact action.
-- The repository updater is separate from the proxy service.
-  `--install-updater` leaves its timer disabled for image preparation;
-  `--enable-updater` enables persistent repository-state polling. Polling alone
-  does not select or deploy a commit, and neither option authorizes restarting
-  the proxy.
-- Do not deploy directly from a dirty worktree. Do not overwrite config, state,
-  logs, reports, or an existing production deployment during an upgrade.
-- Never direct a normal user or tool to the configured upstream
-  ports. These ports are guarded for the proxy owner only; users must use authenticated
-  `20808/20809`.
+## Choose the smallest operation matching the request
 
-## Read-only checks
+| User intent | Command | Scope and effect |
+| --- | --- | --- |
+| Use proxy in this terminal | `pto-auth-proxy on` | Shell environment only; reuse credentials |
+| Stop using PTO proxy in this terminal | `pto-auth-proxy off` | Restore original variables; keep credentials and authd |
+| Change this terminal and future-shell default | `pto-auth-proxy on --default` / `off --default` | Persistent preference; other running processes keep their environment |
+| Run one command directly | `pto-auth-proxy exec --direct -- COMMAND ARGS` | Child environment only; no proxy variables and NO_PROXY=* |
+| Run one command through PTO proxy | `pto-auth-proxy exec --proxy -- COMMAND ARGS` | Child environment only; existing credential, no prompt |
+| Start or recover personal authd | `pto-auth-proxy start` / `restart` | Current user's instance only; keep credentials and shell preference |
+| Stop personal authd | `pto-auth-proxy stop` | Persistently deny new authentication, including after reboot; retain token |
+| First enrollment or revoked/invalid credential | `pto-auth-proxy join` | Local interactive PAM verification, token issuance, shell integration |
+| Revoke enrollment entirely | `pto-auth-proxy leave` | Revoke tokens, persist denial, remove generated shell configuration |
 
-```bash
-pto-auth-proxy validate
-pto-auth-proxy traffic 30
-pto-auth-proxy status
-ss -lnt | grep -E ':(20808|20809)\b'
-# Also inspect the upstream port explicitly configured on this host.
-```
+`off` restores the environment from before `on`, which may include an external
+proxy. Use `exec --direct` when a command needs an explicitly direct environment.
+Explicit application settings (e.g. Git http.proxy or VS Code settings) may take
+precedence; diagnose and report them without displaying proxy URLs. Do not
+silently edit application settings or fall back to direct access on failure.
 
-Inspect only credential-free fields when diagnosing configuration. Proxy URLs
-must always be redacted before display.
+## Shell integration and existing applications
 
-## User commands
-
-Use the public command instead of asking users to locate or execute repository
-scripts directly:
+`on/off` need a shell function because a child process cannot change its parent.
+`join` installs a credential-free hook in Bash/Zsh startup configuration. For
+an existing terminal, have the user run (on older enrollments run
+`pto-auth-proxy setup-shell` first; it reuses credentials without PAM/rotation):
 
 ```bash
-pto-auth-proxy join
-pto-auth-proxy leave
-pto-auth-proxy status
-pto-auth-proxy test
+source "${XDG_CONFIG_HOME:-$HOME/.config}/pto-auth-proxy/env.sh"
+pto-auth-proxy off
 ```
 
-`join` is needed once for onboarding or later for explicit credential repair.
-It privately prompts once for the Linux password. A token-capable authd verifies
-PAM, issues a random proxy token, persists only its digest, creates a mode-0600
-credential/environment file, and idempotently connects it to `.bashrc` or
-`.zshrc`. The previous token has a ten-minute rotation grace. Older authd
-versions remain compatible with password credentials during rolling upgrades.
-HTTP/HTTPS variables use authenticated port `20809`; `ALL_PROXY/all_proxy` use
-authenticated SOCKS5 port `20808`. Never configure either family to use the
-direct upstream ports.
+In an AI's non-interactive command environment, prefer `exec --proxy/--direct`:
+its scope is concrete and it needs no persistent shell setup. Do not print
+credential-bearing shell code, use `eval "$(...)"`, or source arbitrary user
+startup files just to switch modes. New terminals inherit the saved preference;
+running VS Code/Codex needs a user-initiated Reload Window to change its environment.
+Never kill user tools to apply a proxy change.
 
-`join` prefers an active system instance `pto-auth-proxy-authd@<user>.service`;
-otherwise it installs the compatibility per-home watchdog for the current boot.
-`pto-auth-proxy-authd-members.service` enumerates `proxyusers` and starts all
-per-user system instances at every server boot, so an onboarded user must not be
-asked to re-run `join` after reboot. Re-running `join` must not create a second
-daemon beside a healthy system instance. System instances use protected
-per-user sockets below `/run/pto-auth-proxy/<uid>/`; `/tmp` is only a legacy
-compatibility fallback.
+## Lifecycle and troubleshooting boundaries
 
-`leave` is the inverse of user onboarding. It removes generated credentials
-and shell blocks and writes `~/.config/pto-auth-proxy/access.disabled`, which
-causes both token and PAM authentication to fail even if a system-managed authd
-remains active or returns after reboot. A later successful `join` removes the
-marker. Existing processes retain their environment and existing TCP streams
-are not forcibly terminated. Group membership remains the administrator's
-authorization boundary; decommissioned accounts should also be removed from
-`proxyusers` and have their system authd instance stopped.
+- `start/stop/restart` operate only the caller's `pto-auth-proxy-authd@<user>.service`.
+  They do not repair an unavailable shared listener, backend service or SSH tunnel.
+  Normal users need the administrator to install `--install-user-controls` once.
+  Keep the existing system instance authoritative; do not start a home watchdog
+  beside it. `pto-auth-proxy-authd-members.service` handles boot startup and honors
+  the user's persistent stop marker.
+- `stop` and `leave` deny new authentication; established TCP streams continue.
+  Immediate per-user disconnection and delegated shared-proxy restart are not
+  implemented. Do not promise either behavior or substitute a shared restart.
+- `start/restart` never clear a logout marker; after `leave`, use local `join`.
+  A successful `join` issues a token with a ten-minute rotation grace. Do not use
+  `join` as a routine restart or temporary proxy switch.
+- `doctor` suggests personal restart for authd failure, local `join` for credential
+  failure, and administrator diagnosis for shared listener/upstream/guard faults.
+  A staged update may load at the next service restart; inspect the pending notice.
+- The authenticated entry points default to HTTP 20809 and SOCKS5 20808. The
+  SOCKS upstream is configured with `PTO_AUTH_PROXY_UPSTREAM_PORT`, without a
+  default. Users must not bypass auth by connecting to guarded upstream ports.
 
-After onboarding, ask the user to open a new terminal. A running VS Code/Codex
-process needs a user-initiated Reload Window because an existing process cannot
-inherit new environment variables. Do not kill or restart user tools from
-`join`. Use `pto-auth-proxy status` for normal diagnosis; `READY` accepts both
-`authd=token` and the rolling-upgrade `authd=legacy` state.
+Passwords are entered only by the user in their local interactive terminal.
+Never request them in chat or place credentials in command arguments, logs,
+repository files or tool configuration. Do not dump proxy environment variables,
+secret files or expanded proxy URLs. Inspect only redacted diagnostic output.
 
-`test` is an interactive end-to-end check and may require the user to enter a
-credential locally. Never enter, capture, or relay that credential for them.
-
-## GitHub acceptance boundary
-
-Core GitHub access includes:
-
-- repository HTML at `github.com`;
-- repository metadata from `api.github.com`;
-- raw files from `raw.githubusercontent.com`;
-- HTTPS Git smart protocol and codeload/assets hosts.
-
-The repository's automated tests verify host policy. The interactive
-`pto-auth-proxy test` command performs real GitHub content retrieval using a
-password entered privately by the user in their own terminal. Never enter or
-capture that password on the user's behalf.
-
-Do not broaden the whitelist to GHCR, GitHub Pages, GitHub Codespaces, or other
-products unless the user explicitly requests that scope and an administrator
-accepts the additional egress.
-
-## Configuration changes
-
-Do not assume any backend product or port. Read `PTO_AUTH_PROXY_UPSTREAM_HOST`
-and `PTO_AUTH_PROXY_UPSTREAM_PORT` from the installed config, then compare with
-the backend listener and the latest proxy startup log. The upstream speaks
-standard no-auth SOCKS5; a local mihomo mixed-port or an SSH tunnel is valid.
-The upstream port has no default. Never discover it by probing arbitrary ports
-or replace an existing configured port with a documentation example.
-`PTO_AUTH_PROXY_GUARD_PORTS` defaults to the configured upstream port; an explicit
-list must include that port. On older installations, remove obsolete guard
-values when changing the upstream. Check `config/auto-update.env` too: new
-templates read the same auth-proxy config, but upgrades preserve existing local
-updater config, including any legacy fixed fetch proxy. Migrate that section
-explicitly before relying on the updater. Backend service/tunnel lifecycle stays
-with its own service manager.
-
-Before proposing a change:
-
-1. Read the current installed config and whitelist with secrets redacted.
-2. Confirm whether the requested domain is already covered by an existing glob.
-3. Prefer the narrowest domain pattern that supports the required workflow.
-4. Run repository tests and `pto-auth-proxy validate` against the candidate
-   configuration.
-5. Report the exact diff. Do not signal or restart the running service unless
-   separately requested.
-
-## Deployment
-
-The repository installer copies code into the standard `pypto-tools` layout.
-By default it does not install, enable, start, stop, or restart services.
-`--install-service` installs the shared proxy, per-user authd template, boot
-member starter, and egress guard without enabling or starting them.
-`--enable-service` explicitly enables these boot services, but still does not
-start or restart them immediately. Individual authd instances do not need to be
-enabled: `pto-auth-proxy-authd-members.service` discovers the authorized group
-on every boot.
-
-Keep the server timer enabled for persistent repository-state checks. Interpret
-the main repository's `update/rollout.json` as follows:
-
-- `enabled=false`: deployment is paused; polling may continue.
-- `enabled=true` with an empty `target`: deployment is armed but idle. Treat
-  this as healthy; do not test or install a candidate.
-- `enabled=true` with a full commit ID: verify and stage that exact commit. Do
-  not substitute the current branch HEAD.
-
-For a targeted rollout, require the target to be an ancestor of the configured
-main branch and increase `sequence`. Require `allow_rollback=true` for a
-downgrade. Always merge code and tests before publishing the separate manifest
-control commit. Never point `target` at the control commit itself unless that is
-the version intentionally being deployed.
-
-The updater fetches as the unprivileged proxy owner through the owner-only local
-SOCKS upstream when root has no direct egress. It preserves local
-configuration/state/logs and stages the candidate without restarting proxy or
-authd services. The auth-proxy adapter stages matching service units and runs
-daemon-reload, but does not enable, start, or restart them; an apply failure
-restores both application files and units. Only `activation=next-restart` is accepted. Never change this
-to remote forced restart behavior: uninterrupted authenticated proxy access
-takes priority.
-
-Keep updater installations compatible with `ProtectSystem=strict`. If the
-global command symlink already points to the deployed application, the
-installer must skip rewriting it instead of granting the updater broad write
-access to `/usr/local/bin`.
-
-The polling engine is the reusable `modules/repo_auto_update/` module. It must
-remain tool-neutral. Auth-proxy-specific verification, backup, and installation
-belong in `scripts/auto-update-adapter.sh`. Another tool should copy the module,
-create its own root-owned config from `example.env`, and provide its own verify
-and apply adapters; do not add other tools' behavior to the generic engine.
-
-The egress guard uses IPv4/IPv6 owner rules so only the configured proxy owner
-can connect directly to the configured loopback upstream ports. The authenticated
-service remains
-non-root and reaches the upstream as that owner. The guard continuously checks
-and repairs rule drift, and the shared proxy verifies the rules before each
-start. Verify the service and access matrix with `pto-auth-proxy status` after
-deployment.
-
-Client handshake, upstream connect/handshake, half-close relay, and writer-close timeouts are
-local containment controls. They do not repair an unavailable remote tunnel;
-they make it fail promptly and prevent abandoned relay tasks from accumulating.
-
-Production cutover requires a shadow-port test and an explicit rollback plan;
-follow the repository README and preserve the previous deployment until
-acceptance passes. Treat the later `systemctl start` or `restart` as a separate
-state-changing operation requiring explicit user intent.
+Perform user-local switches or lifecycle operations when requested; existing user
+authorization is sufficient. Shared service restart, egress rules, whitelist and
+deployment changes require user intent covering those operations. For those
+administrator tasks read [administration.md](references/administration.md).
+The installer with `--enable-service` only enables boot startup; it does not
+immediately start/restart the proxy. Updates remain staged until restart.

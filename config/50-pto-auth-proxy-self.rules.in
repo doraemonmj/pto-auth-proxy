@@ -1,0 +1,19 @@
+// Installed only by the administrator's explicit --install-user-controls.
+// SSH sessions are supported; no active/local desktop session is required.
+polkit.addRule(function(action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units" ||
+        !subject.isInGroup("@PROXY_GROUP@") ||
+        !/^[a-zA-Z0-9_.-]+$/.test(subject.user)) {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var verb = action.lookup("verb");
+    if (verb !== "start" && verb !== "stop" && verb !== "restart") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    // Match systemd-escape for the supported Unix account-name characters.
+    var instance = subject.user.replace(/-/g, "\\x2d").replace(/^\./, "\\x2e");
+    if (action.lookup("unit") === "pto-auth-proxy-authd@" + instance + ".service") {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});

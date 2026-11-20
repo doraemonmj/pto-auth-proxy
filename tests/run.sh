@@ -6,6 +6,7 @@ PROJECT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 for file in \
     "$PROJECT_DIR/bin/pto-auth-proxy" \
     "$PROJECT_DIR/configure-shell.sh" \
+    "$PROJECT_DIR/shell-integration.sh" \
     "$PROJECT_DIR/join-proxy.sh" \
     "$PROJECT_DIR/leave-proxy.sh" \
     "$PROJECT_DIR/test_proxy.sh" \
@@ -18,7 +19,7 @@ for file in \
 done
 
 PYTHONDONTWRITEBYTECODE=1 python3 - "$PROJECT_DIR/auth_proxy.py" \
-    "$PROJECT_DIR/authd.py" "$PROJECT_DIR/status_proxy.py" \
+    "$PROJECT_DIR/authd.py" "$PROJECT_DIR/status_proxy.py" "$PROJECT_DIR/user_proxy.py" \
     "$PROJECT_DIR/modules/repo_auto_update/manifest.py" <<'PY'
 from pathlib import Path
 import sys
@@ -61,9 +62,7 @@ AUTHD_UNIT="$PROJECT_DIR/systemd/pto-auth-proxy-authd@.service.in"
 grep -Fq 'User=%I' "$AUTHD_UNIT"
 grep -Fq 'ExecStart=/usr/bin/python3 @PREFIX@/auth-proxy/authd.py' "$AUTHD_UNIT"
 grep -Fq 'EnvironmentFile=-@TOOL_DIR@/config/auth-proxy.env' "$AUTHD_UNIT"
-grep -Fq 'ExecStartPre=-/usr/bin/pkill -u %I -f authproxy-watchdog.sh' \
-    "$AUTHD_UNIT"
-grep -Fq 'ExecStartPre=-/usr/bin/pkill -u %I -f authproxy-authd.py' \
+grep -Fq 'ExecStartPre=/usr/bin/python3 @PREFIX@/auth-proxy/user_proxy.py stop-compatibility' \
     "$AUTHD_UNIT"
 grep -Fq 'Restart=always' "$AUTHD_UNIT"
 grep -Fq 'PrivateTmp=false' "$AUTHD_UNIT"

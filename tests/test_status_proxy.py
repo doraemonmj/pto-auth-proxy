@@ -1,6 +1,8 @@
 import contextlib
 import io
 import os
+from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 
@@ -9,11 +11,24 @@ import status_proxy
 
 class StatusTest(unittest.TestCase):
     def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        for name in ("access_dir", "config_dir"):
+            patch = mock.patch.object(status_proxy.user_proxy, name, return_value=self.directory)
+            patch.start()
+            self.addCleanup(patch.stop)
         environment = mock.patch.dict(os.environ, {
             "PTO_AUTH_PROXY_UPSTREAM_HOST": "127.0.0.1",
             "PTO_AUTH_PROXY_UPSTREAM_PORT": "7895",
             "PTO_AUTH_PROXY_GUARD_PORTS": "7895",
         })
+        self.probe_patch = mock.patch.object(status_proxy, "https_probe", return_value="ok")
+        self.probe_patch.start()
+        self.addCleanup(self.probe_patch.stop)
+        self.git_patch = mock.patch.object(status_proxy, "git_proxy_configured", return_value=False)
+        self.git_patch.start()
+        self.addCleanup(self.git_patch.stop)
         environment.start()
         self.addCleanup(environment.stop)
 
@@ -27,7 +42,7 @@ class StatusTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True), \
              mock.patch.object(status_proxy, "authenticated_connect") as connect, \
              contextlib.redirect_stdout(io.StringIO()) as output:
-            result = status_proxy.main()
+            result = status_proxy.main("doctor")
         self.assertEqual(result, 1)
         self.assertIn("upstream=unconfigured", output.getvalue())
         connect.assert_not_called()
@@ -70,7 +85,7 @@ class StatusTest(unittest.TestCase):
              mock.patch.object(status_proxy, "guard_service_active",
                                return_value=True), \
              contextlib.redirect_stdout(output):
-            result = status_proxy.main()
+            result = status_proxy.main("doctor")
         self.assertEqual(result, 0)
         self.assertIn("READY", output.getvalue())
         self.assertNotIn("top-secret", output.getvalue())
@@ -93,7 +108,7 @@ class StatusTest(unittest.TestCase):
              mock.patch.object(status_proxy, "guard_service_active",
                                return_value=True), \
              contextlib.redirect_stdout(output):
-            result = status_proxy.main()
+            result = status_proxy.main("doctor")
         self.assertEqual(result, 1)
         self.assertIn("NOT_READY", output.getvalue())
         self.assertIn("guard=upstream-unprotected", output.getvalue())
@@ -114,7 +129,7 @@ class StatusTest(unittest.TestCase):
              mock.patch.object(status_proxy, "guard_service_active",
                                return_value=True), \
              contextlib.redirect_stdout(output):
-            result = status_proxy.main()
+            result = status_proxy.main("doctor")
         self.assertEqual(result, 1)
         self.assertIn("LEFT", output.getvalue())
         self.assertIn("proxy=disabled", output.getvalue())
@@ -141,6 +156,78 @@ class StatusTest(unittest.TestCase):
             url, source = status_proxy.proxy_url("user", "127.0.0.1", 20809)
         self.assertIsNone(url)
         self.assertEqual(source, "missing")
+
+    def test_status_reports_direct_choice_without_external_or_guard_probes(self):
+        (self.directory / "default-mode").write_text("direct\n")
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(status_proxy, "access_disabled", return_value=False), \
+             mock.patch.object(status_proxy, "group_member", return_value=True), \
+             mock.patch.object(status_proxy, "authd_capability", return_value=(True, "token")), \
+             mock.patch.object(status_proxy, "proxy_url", return_value=(None, "missing")), \
+             mock.patch.object(status_proxy, "authenticated_connect") as connect, \
+             mock.patch.object(status_proxy, "direct_access_is_correct") as direct, \
+             mock.patch.object(status_proxy, "guard_service_active") as guard, \
+             contextlib.redirect_stdout(output):
+            self.assertEqual(status_proxy.main(), 0)
+        self.assertIn("shell=direct default=direct", output.getvalue())
+        self.assertNotIn("READY:", output.getvalue())
+        connect.assert_not_called()
+        direct.assert_not_called()
+        guard.assert_not_called()
+
+    def test_shell_mode_detects_external_mixed_and_bypassed_environments(self):
+        for environment, expected in (
+            ({}, "direct"),
+            ({"HTTP_PROXY": "http://elsewhere:3128"}, "external"),
+            ({"HTTP_PROXY": "http://user:secret@127.0.0.1:20809"}, "mixed"),
+            ({"HTTP_PROXY": "http://user:secret@127.0.0.1:20809", "NO_PROXY": "*"}, "bypassed"),
+            ({"HTTP_PROXY": "http://user:secret@127.0.0.1:bad"}, "external"),
+        ):
+            with self.subTest(expected=expected), mock.patch.dict(os.environ, environment, clear=True):
+                self.assertEqual(status_proxy.shell_mode("127.0.0.1", 20809, 20808), expected)
+
+    def test_stopped_doctor_skips_new_authentication(self):
+        (self.directory / "authd.stopped").touch()
+        output = io.StringIO()
+        with mock.patch.object(status_proxy, "access_disabled", return_value=False), \
+             mock.patch.object(status_proxy, "group_member", return_value=True), \
+             mock.patch.object(status_proxy, "authd_capability", return_value=(False, "down")), \
+             mock.patch.object(status_proxy, "proxy_url", return_value=(None, "missing")), \
+             mock.patch.object(status_proxy, "authenticated_connect") as connect, \
+             mock.patch.object(status_proxy, "direct_access_is_correct", return_value=True), \
+             mock.patch.object(status_proxy, "guard_service_active", return_value=True), \
+             contextlib.redirect_stdout(output):
+            self.assertEqual(status_proxy.main("doctor"), 1)
+        self.assertIn("STOPPED:", output.getvalue())
+        self.assertIn("pto-auth-proxy start", output.getvalue())
+        connect.assert_not_called()
+
+
+class HttpsProbeTest(unittest.TestCase):
+    def test_probe_uses_default_trust_and_target_hostname(self):
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.recv.side_effect = [bytes([byte]) for byte in b"HTTP/1.1 200 OK\r\n\r\n"]
+        context = mock.MagicMock()
+        tls = context.wrap_socket.return_value.__enter__.return_value
+        tls.recv.return_value = b"HTTP/1.1 403 Forbidden\r\n"
+        with mock.patch.object(status_proxy.socket, "create_connection", return_value=client), \
+             mock.patch.object(status_proxy.ssl, "create_default_context", return_value=context) as create:
+            self.assertEqual(status_proxy.https_probe("http://alice:private-token@127.0.0.1:20809"), "ok")
+        create.assert_called_once_with()
+        context.wrap_socket.assert_called_once_with(client, server_hostname="api.github.com")
+        self.assertIn(b"HEAD / HTTP/1.1", tls.sendall.call_args.args[0])
+
+    def test_probe_rejects_tls_errors_without_echoing_secrets(self):
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.recv.side_effect = [bytes([byte]) for byte in b"HTTP/1.1 200 OK\r\n\r\n"]
+        context = mock.MagicMock()
+        context.wrap_socket.side_effect = status_proxy.ssl.SSLError("private-token")
+        with mock.patch.object(status_proxy.socket, "create_connection", return_value=client), \
+             mock.patch.object(status_proxy.ssl, "create_default_context", return_value=context):
+            self.assertEqual(status_proxy.https_probe("http://alice:private-token@127.0.0.1:20809"), "tls-failed")
 
 
 if __name__ == "__main__":

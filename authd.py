@@ -74,6 +74,7 @@ _TOKEN_ALPHABET = frozenset(
 _TOKEN_DIR = os.path.join(_MY_HOME, ".config", "pto-auth-proxy")
 _TOKEN_HASH_FILE = os.path.join(_TOKEN_DIR, "token.sha256")
 _DISABLED_FILE = os.path.join(_TOKEN_DIR, "access.disabled")
+_STOPPED_FILE = os.path.join(_TOKEN_DIR, "authd.stopped")
 _TOKEN_ROTATION_GRACE = 600
 
 _SYSTEM_RUNTIME_DIR = f"/run/pto-auth-proxy/{_UID}"
@@ -289,7 +290,7 @@ async def _pam_call_async(user: str, password: str):
 
 async def _authenticate(user: str, credential: str):
     """Authenticate a token when it matches, otherwise preserve PAM fallback."""
-    if _access_disabled():
+    if _access_disabled() or os.path.exists(_STOPPED_FILE):
         return {
             "ok": False,
             "code": -8,
@@ -443,6 +444,10 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--check-enabled"]:
+        raise SystemExit(1 if os.path.exists(_STOPPED_FILE) else 0)
+    if os.path.exists(_STOPPED_FILE):
+        raise SystemExit("authd is stopped by the current user")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
