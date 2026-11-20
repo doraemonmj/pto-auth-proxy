@@ -89,7 +89,10 @@ Never kill user tools to apply a proxy change.
   implemented. Do not promise either behavior or substitute a shared restart.
 - `start/restart` never clear a logout marker; after `leave`, use local `join`.
   A successful `join` issues a token with a ten-minute rotation grace. Do not use
-  `join` as a routine restart or temporary proxy switch.
+  `join` as a routine restart or temporary proxy switch. Failed join restores
+  previous stop/logout state, even if token issuance succeeded before shell setup
+  failed. The client verifies the authd peer UID before sending any credential;
+  an identity failure needs administrator inspection, not repeated password entry.
 - `doctor` suggests personal restart for authd failure, local `join` for credential
   failure, and administrator diagnosis for shared listener/upstream/guard faults.
   A staged update may load at the next service restart; inspect the pending notice.

@@ -50,12 +50,19 @@ source "${XDG_CONFIG_HOME:-$HOME/.config}/pto-auth-proxy/env.sh"
 自动入口的两条路径都检查用户组、认证和审计。其直连路径只允许解析为公共 IP 的目标，
 默认端口为 80/443，可由管理员用 `PTO_AUTH_PROXY_DIRECT_PORTS` 配置；DNS 结果经过检查
 并固定到实际连接的数字地址，阻止经服务账号访问本机、内网、元数据和受保护的上游。
-本机和内网由应用通过 `NO_PROXY` 直接访问，避免借用服务账号权限。
+本机和内网由应用通过 `NO_PROXY` 直接访问，避免借用服务账号权限。强制代理也不再
+隐含放行回环 IP；公共 IP 字面量需要白名单精确批准，私有地址及映射私有地址拒绝转发。
 服务器没有对应的直接网络出口时，直连仍会失败。
+普通 HTTP 每个连接只转发一个完整请求，按 Content-Length 或 chunked 边界传送请求体，
+并移除代理认证头及认证 trailer；不会将后续请求作为原始流透传。HTTPS CONNECT
+保持双向隧道，供 TLS、流式响应和 WebSocket 使用。
 
 `stop` 保存 `~/.config/pto-auth-proxy/authd.stopped` 并停止个人认证服务，
 开机成员启动器和 authd 自身都遵守这个标记。凭据及 shell 偏好保留，`start` 可恢复。
 `start/restart` 不清除 `leave` 的注销状态；注销后需要本地交互运行 `join`。
+`join` 在发送凭据前校验 authd socket 的对端 UID，必须是当前用户；继承的 shell
+调试和自动导出模式不会输出凭据或将本地密码变量传入子进程。接入失败（包括 PAM
+验证失败或 shell 配置失败）会恢复原先的 stop/leave 状态，避免失败操作意外恢复访问。
 `stop/leave` 都只拒绝新认证，已建立的业务连接继续；强制断开个人连接和委托重启共享
 代理尚未提供。当前终端的切换也不影响其他终端、已经运行的 VS Code/Codex 或服务。
 

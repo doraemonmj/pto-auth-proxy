@@ -14,6 +14,10 @@ stop cleanly.
 Dependencies: Python 3 stdlib + libpam.so.0 (present on any Linux with PAM).
 """
 from __future__ import annotations
+import base64 as _b64
+import collections as _collections
+import datetime as _dt
+import json as _json_pam
 import asyncio
 import fnmatch
 from functools import partial
@@ -139,9 +143,7 @@ DEFAULT_WHITELIST = [
     "googleusercontent.com","*.googleusercontent.com",
     "gvt1.com",             "*.gvt1.com",
 ]
-# IP literals that are always allowed (localhost variants -- Claude Code
-# uses these for its OAuth callback server).
-ALLOW_IPS_DEFAULT = {"127.0.0.1", "::1"}
+# Local OAuth callbacks bypass the proxy via NO_PROXY under the user's identity.
 
 _whitelist: list[str] = []
 _group_members: set[str] = set()
@@ -157,7 +159,6 @@ _group_mtime = 0.0
 # /run/user/<their-uid>/authproxy-authd.sock (mode 0600). We connect there.
 # Because only that user can create/write that socket, the reply is trusted.
 
-import json as _json_pam  # avoid shadowing the top-level import
 
 
 async def pam_check_async(user: str, password: str) -> bool:
@@ -279,10 +280,10 @@ def load_whitelist() -> None:
 def host_allowed(host: str) -> bool:
     h = host.lower().rstrip(".")
     try:
-        ipaddress.ip_address(h)
-        # Loopback + explicitly-allowed IPs pass. Everything else is denied
-        # (public IP literals almost never legit, and they bypass domain rules).
-        return h in ALLOW_IPS_DEFAULT
+        ip = ipaddress.ip_address(h)
+        # Literals need exact administrator approval. Never implicitly authorize
+        # loopback/private addresses, which could tunnel back into a SOCKS port.
+        return public_address(ip) and h in _whitelist
     except ValueError:
         pass
     return any(fnmatch.fnmatch(h, pat) for pat in _whitelist)
@@ -320,6 +321,18 @@ class DirectDenied(Exception):
     pass
 
 
+def public_address(ip) -> bool:
+    if not ip.is_global or ip.is_multicast or ip.is_loopback or ip.is_link_local:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address):
+        embedded = ip.ipv4_mapped or ip.sixtofour
+        if ip in ipaddress.IPv6Network("64:ff9b::/96"):
+            embedded = ipaddress.IPv4Address(int(ip) & 0xffffffff)
+        if embedded is not None:
+            return public_address(embedded)
+    return True
+
+
 async def open_direct(host: str, port: int):
     """Resolve once and connect only to checked numeric public addresses.
 
@@ -328,6 +341,12 @@ async def open_direct(host: str, port: int):
     """
     if port not in DIRECT_PORTS:
         raise DirectDenied("direct destination port is not enabled")
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None and not public_address(literal):
+        raise DirectDenied("direct IP literal must be public")
 
     async def connect():
         addresses = await asyncio.get_running_loop().getaddrinfo(
@@ -337,7 +356,7 @@ async def open_direct(host: str, port: int):
         targets = set()
         for family, _, _, _, address in addresses:
             ip = ipaddress.ip_address(address[0].split("%", 1)[0])
-            if not ip.is_global or ip.is_multicast or ip.is_loopback or ip.is_link_local:
+            if not public_address(ip):
                 raise DirectDenied("direct destinations must resolve only to public addresses")
             targets.add((family, address[0]))
         for family, address in sorted(targets):
@@ -672,7 +691,107 @@ async def handle(cr: asyncio.StreamReader, cw: asyncio.StreamWriter, *, route_mo
 #   5. Open SOCKS5 to the configured UPSTREAM and hand it the target
 #   6. Reply "HTTP/1.1 200 Connection Established" and pipe both ways
 # ============================================================
-import base64 as _b64
+
+
+class _HttpBodyReader:
+    """Expose exactly one framed HTTP body, never a following proxy request."""
+    def __init__(self, source, initial: bytes, headers: list[bytes]):
+        lengths, encodings = [], []
+        for line in headers:
+            key, separator, value = line.partition(b":")
+            if separator and key.strip().lower() == b"content-length":
+                lengths.append(value.strip())
+            if separator and key.strip().lower() == b"transfer-encoding":
+                encodings.append(value.strip().lower())
+        if len(lengths) > 1 or len(encodings) > 1 or (lengths and encodings):
+            raise ValueError("ambiguous request body framing")
+        if encodings and encodings[0] != b"chunked":
+            raise ValueError("unsupported transfer encoding")
+        if lengths and (not lengths[0].isdigit() or len(lengths[0]) > 19):
+            raise ValueError("invalid content length")
+        self.source, self.buffer = source, initial
+        self.remaining = int(lengths[0]) if lengths else 0
+        self.chunked = bool(encodings)
+        self.pending = b""
+        self.failed = False
+        self.pieces = self._pieces()
+
+    async def _take(self, count: int) -> bytes:
+        if self.buffer:
+            data, self.buffer = self.buffer[:count], self.buffer[count:]
+            return data
+        data = await asyncio.wait_for(self.source.read(count), timeout=CLIENT_HANDSHAKE_TIMEOUT)
+        if not data:
+            raise ValueError("truncated HTTP request body")
+        return data
+
+    async def _line(self) -> bytes:
+        while b"\r\n" not in self.buffer:
+            if len(self.buffer) > 16384:
+                raise ValueError("HTTP body metadata too large")
+            data = await asyncio.wait_for(self.source.read(4096), timeout=CLIENT_HANDSHAKE_TIMEOUT)
+            if not data:
+                raise ValueError("truncated HTTP body metadata")
+            self.buffer += data
+        line, self.buffer = self.buffer.split(b"\r\n", 1)
+        if len(line) > 16384:
+            raise ValueError("HTTP body metadata too large")
+        return line
+
+    async def _pieces(self):
+        if not self.chunked:
+            while self.remaining:
+                data = await self._take(min(self.remaining, 65536))
+                self.remaining -= len(data)
+                yield data
+            return
+        while True:
+            line = await self._line()
+            size = line.partition(b";")[0]
+            if not size or len(size) > 16 or any(char not in b"0123456789abcdefABCDEF" for char in size):
+                raise ValueError("invalid HTTP chunk size")
+            remaining = int(size, 16)
+            yield line + b"\r\n"
+            if not remaining:
+                break
+            while remaining:
+                data = await self._take(min(remaining, 65536))
+                remaining -= len(data)
+                yield data
+            ending = b""
+            while len(ending) < 2:
+                ending += await self._take(2 - len(ending))
+            if ending != b"\r\n":
+                raise ValueError("invalid HTTP chunk ending")
+            yield ending
+        trailer_bytes = 0
+        while True:
+            line = await self._line()
+            trailer_bytes += len(line) + 2
+            if trailer_bytes > 16384:
+                raise ValueError("HTTP trailers too large")
+            if not line:
+                yield b"\r\n"
+                return
+            key, separator, _ = line.partition(b":")
+            if not separator:
+                raise ValueError("invalid HTTP trailer")
+            if key.strip().lower() not in {b"proxy-authorization", b"proxy-connection", b"connection",
+                                          b"host", b"content-length", b"transfer-encoding"}:
+                yield line + b"\r\n"
+
+    async def read(self, count: int) -> bytes:
+        try:
+            while not self.pending:
+                self.pending = await self.pieces.__anext__()
+        except StopAsyncIteration:
+            return b""
+        except (ValueError, OSError, asyncio.TimeoutError):
+            self.failed = True
+            return b""  # Half-close the origin; never forward unframed data.
+        data, self.pending = self.pending[:count], self.pending[count:]
+        return data
+
 
 async def _read_http_headers(reader: asyncio.StreamReader,
                              max_bytes: int = 16 * 1024
@@ -754,7 +873,7 @@ async def handle_http(cr: asyncio.StreamReader, cw: asyncio.StreamWriter, *, rou
                 await _reply("400 Bad Request", "absolute http:// target required\n")
                 return
             host = parsed.hostname
-            port = parsed.port or 80
+            port = parsed.port if parsed.port is not None else 80
         if not 1 <= port <= 65535:
             verdict = "bad_target"
             await _reply("400 Bad Request", "invalid port\n")
@@ -794,6 +913,15 @@ async def handle_http(cr: asyncio.StreamReader, cw: asyncio.StreamWriter, *, rou
                          "bad credentials\n",
                          extra='Proxy-Authenticate: Basic realm="authproxy"\r\n')
             return
+
+        body = None
+        if not tunnel:
+            try:
+                body = _HttpBodyReader(cr, initial_payload, header_lines)
+            except ValueError:
+                verdict = "bad_framing"
+                await _reply("400 Bad Request", "invalid HTTP request framing\n")
+                return
 
         route = target_route(host, route_mode)
         if route == "proxy" and not host_allowed(host):
@@ -880,12 +1008,14 @@ async def handle_http(cr: asyncio.StreamReader, cw: asyncio.StreamWriter, *, rou
 
         # A client may coalesce the first TLS bytes with the CONNECT headers.
         # Preserve them instead of silently dropping them during header parsing.
-        if initial_payload:
+        if tunnel and initial_payload:
             up_bytes[0] += len(initial_payload)
             up_writer.write(initial_payload)
             await up_writer.drain()
 
-        await _relay(cr, cw, up_reader, up_writer, up_bytes, down_bytes)
+        await _relay(body if body is not None else cr, cw, up_reader, up_writer, up_bytes, down_bytes)
+        if body is not None and body.failed:
+            verdict = "bad_body"
 
     except (asyncio.IncompleteReadError, ConnectionResetError, ValueError) as e:
         if verdict == "?":
@@ -926,8 +1056,6 @@ async def handle_http(cr: asyncio.StreamReader, cw: asyncio.StreamWriter, *, rou
 # `grep '\[ALERT\]' auth_proxy.log` shows a clean incident list.
 # Reports are generated shortly after midnight for the previous local day.
 
-import collections as _collections
-import datetime as _dt
 
 
 def _emit_alert(entry: dict) -> None:
@@ -1207,14 +1335,20 @@ def _generate_report(day: _dt.date) -> None:
                 totals["connections"] += 1
                 proto_split[e.get("proto", "socks")] += 1
                 if v == "ok":
-                    pu["ok"] += 1; totals["ok"] += 1
+                    pu["ok"] += 1
+                    totals["ok"] += 1
                 elif v == "auth_fail":
-                    pu["auth_fail"] += 1; totals["auth_fail"] += 1
+                    pu["auth_fail"] += 1
+                    totals["auth_fail"] += 1
                 elif v in {"denied", "direct_denied"}:
-                    pu["denied"] += 1; totals["denied"] += 1
-                bu = e.get("bytes_up", 0); bd = e.get("bytes_down", 0)
-                pu["bytes_up"] += bu; pu["bytes_down"] += bd
-                totals["bytes_up"] += bu; totals["bytes_down"] += bd
+                    pu["denied"] += 1
+                    totals["denied"] += 1
+                bu = e.get("bytes_up", 0)
+                bd = e.get("bytes_down", 0)
+                pu["bytes_up"] += bu
+                pu["bytes_down"] += bd
+                totals["bytes_up"] += bu
+                totals["bytes_down"] += bd
                 host = e.get("host") or ""
                 if host:
                     pu["hosts"][host] += 1

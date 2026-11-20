@@ -243,6 +243,26 @@ class UserControlTest(unittest.TestCase):
 
 
 class ShellControlTest(unittest.TestCase):
+    def test_setup_does_not_export_stdin_credentials_to_python_children(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            leaked = home / "leaked"
+            (home / "sitecustomize.py").write_text('''
+import os
+from pathlib import Path
+if any("synthetic-config-secret" in value for value in os.environ.values()):
+    Path(os.environ["FIXTURE_LEAK"]).touch()
+''')
+            environment = {"PATH": os.environ["PATH"], "HOME": temporary, "PYTHONPATH": temporary,
+                           "SHELL": "/bin/bash", "SHELLOPTS": "allexport:xtrace", "FIXTURE_LEAK": str(leaked),
+                           "PROXY_CREDENTIAL": "inherited-placeholder"}
+            result = subprocess.run(["bash", str(ROOT / "configure-shell.sh"), "testuser"],
+                                    env=environment, input="synthetic-config-secret", text=True,
+                                    capture_output=True)
+            self.assertEqual(result.returncode, 0)
+            self.assertFalse(leaked.exists())
+            self.assertNotIn("synthetic-config-secret", result.stdout + result.stderr)
+
     def test_setup_does_not_echo_credential_with_inherited_xtrace(self):
         with tempfile.TemporaryDirectory() as temporary:
             environment = {"PATH": os.environ["PATH"], "HOME": temporary,

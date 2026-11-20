@@ -16,9 +16,16 @@
 #
 # Usage:  pto-auth-proxy join
 
+set +ax  # Inherited tracing/allexport must not disclose or export credentials.
+unset PW AUTH_RESULT PROXY_CREDENTIAL AUTH_MODE || exit 1
 set -u
 ME=$(id -un)
 UID_NUM=$(id -u)
+ACCOUNT_HOME=$(getent passwd "$ME" | cut -d: -f6)
+[[ "$ACCOUNT_HOME" == /* ]] || {
+  echo "Cannot resolve the current account home; ask the administrator." >&2
+  exit 1
+}
 
 pass()   { printf '\033[32m✓\033[0m %s\n' "$*"; }
 fail()   { printf '\033[31m✗\033[0m %s\n' "$*"; }
@@ -27,10 +34,37 @@ header() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 SRC_DIR=${PTO_AUTH_PROXY_SOURCE_DIR:-$SCRIPT_DIR}
-BIN_DIR=$HOME/.local/bin
-LOG_FILE=$HOME/.local/authproxy-authd.log
-DISABLED_FILE=$HOME/.config/pto-auth-proxy/access.disabled
-STOPPED_FILE=$HOME/.config/pto-auth-proxy/authd.stopped
+BIN_DIR=$ACCOUNT_HOME/.local/bin
+LOG_FILE=$ACCOUNT_HOME/.local/authproxy-authd.log
+DISABLED_FILE=$ACCOUNT_HOME/.config/pto-auth-proxy/access.disabled
+STOPPED_FILE=$ACCOUNT_HOME/.config/pto-auth-proxy/authd.stopped
+WAS_STOPPED=0
+WAS_DISABLED=0
+[[ ! -e "$STOPPED_FILE" ]] || WAS_STOPPED=1
+[[ ! -e "$DISABLED_FILE" ]] || WAS_DISABLED=1
+
+finish_join() {
+  local rc=$? marker temporary
+  if ((rc != 0)); then
+    # Issuing a token may already have resumed access. Failed onboarding must
+    # restore the caller's previous stop/logout choice, including config errors.
+    for marker in "$STOPPED_FILE:$WAS_STOPPED" "$DISABLED_FILE:$WAS_DISABLED"; do
+      if [[ ${marker##*:} == 1 ]]; then
+        marker=${marker%:*}
+        mkdir -p -- "${marker%/*}"
+        temporary=$(mktemp "${marker%/*}/.join-restore.XXXXXX") || continue
+        printf '%s\n' 'disabled; previous join did not complete' >"$temporary"
+        chmod 0600 "$temporary"
+        mv -f -- "$temporary" "$marker"
+      fi
+    done
+  fi
+  unset PW AUTH_RESULT PROXY_CREDENTIAL
+}
+trap finish_join EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 PROXY_OWNER=${PTO_AUTH_PROXY_OWNER:-pypto}
 PROXY_GROUP=${PTO_AUTH_PROXY_GROUP:-proxyusers}
 PAM_SERVICE=${PTO_AUTH_PROXY_PAM_SERVICE:-sshd}
@@ -174,7 +208,7 @@ else
   sleep 0.5
   rm -f "$SOCK" 2>/dev/null || true
 
-  setsid nohup bash "$BIN_DIR/authproxy-watchdog.sh" </dev/null \
+  HOME="$ACCOUNT_HOME" setsid nohup bash "$BIN_DIR/authproxy-watchdog.sh" </dev/null \
       >>"$LOG_FILE" 2>&1 &
   disown $! 2>/dev/null || true
   sleep 1
@@ -205,7 +239,7 @@ echo
 # Pass only the socket and username via env. The password is fed over stdin so
 # neither the Linux password nor issued token appears in argv or environment.
 AUTH_RESULT=$(SOCK="$SOCK" USER_NAME="$ME" python3 -c '
-import socket, sys, os, json
+import socket, sys, os, json, struct
 pw = sys.stdin.read().rstrip("\n")
 
 def request(payload):
@@ -213,6 +247,11 @@ def request(payload):
     s.settimeout(12)
     try:
         s.connect(os.environ["SOCK"])
+        peer = s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                            struct.calcsize("iII"))
+        _, peer_uid, _ = struct.unpack("iII", peer)
+        if peer_uid != os.getuid():
+            raise PermissionError("authd socket is not owned by the current user")
         s.sendall((json.dumps(payload) + "\n").encode())
         data = b""
         while b"\n" not in data and len(data) < 16384:
@@ -246,8 +285,9 @@ else:
 AUTH_RC=$?
 unset PW
 if ((AUTH_RC != 0)); then
-  fail "authd rejected authentication: $AUTH_RESULT"
-  info "  If reason mentions faillock, wait 60s and retry."
+  unset AUTH_RESULT
+  fail "authd identity or authentication check failed"
+  info "  Verify your local password or ask the administrator to inspect authd/PAM logs."
   exit 1
 fi
 

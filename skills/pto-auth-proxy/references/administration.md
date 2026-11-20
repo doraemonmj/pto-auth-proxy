@@ -153,3 +153,26 @@ policy. Update existing shell hooks with setup-shell without rotating credential
 `off` now means forced direct; use restore for the former environment-restore
 operation. Explicit saved proxy/direct defaults are kept; absent preference means
 auto. No service is automatically restarted to apply these changes.
+
+
+## Enrollment identity and rollback
+
+Join verifies SO_PEERCRED on every authd connection before sending a request;
+the peer must be the current UID. Inspect instance User= and socket ownership
+if this fails; do not relax peer verification or switch to an unverified socket.
+Join uses the account-database home for daemon paths and persistent stop/logout
+markers. Shell environment files may still use the user's configured XDG path.
+A failed or interrupted join restores prior stop/logout markers, including
+failures after token issuance. Auth responses and shell tracing must not disclose
+credentials; join and shell setup disable inherited xtrace/allexport.
+
+There is no implicit loopback-IP whitelist allowance. Local OAuth callbacks use
+NO_PROXY as the actual user. IP literals require exact public-address approval;
+private/loopback targets and IPv6 forms embedding private IPv4 targets (including
+well-known NAT64) are refused by forwarding policy.
+
+
+Plain HTTP forwards one framed request per connection and requests origin close.
+Content-Length and chunked bodies are bounded to their message boundaries;
+proxy-auth headers/trailers are removed, and following pipelined requests are not
+forwarded as tunnel data. CONNECT continues to carry opaque bidirectional TLS.

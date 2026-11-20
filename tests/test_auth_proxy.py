@@ -49,6 +49,16 @@ class GitHubWhitelistTest(unittest.TestCase):
     def test_non_whitelisted_domain_is_denied(self):
         self.assertFalse(auth_proxy.host_allowed("example.com"))
 
+    def test_force_proxy_has_no_implicit_loopback_ip_authorization(self):
+        for address in ("127.0.0.1", "::1"):
+            self.assertFalse(auth_proxy.host_allowed(address))
+
+    def test_exact_public_ip_approval_never_authorizes_private_or_mapped_private_ip(self):
+        with mock.patch.object(auth_proxy, "_whitelist", ["1.1.1.1", "127.0.0.1", "64:ff9b::7f00:1"]):
+            self.assertTrue(auth_proxy.host_allowed("1.1.1.1"))
+            self.assertFalse(auth_proxy.host_allowed("127.0.0.1"))
+            self.assertFalse(auth_proxy.host_allowed("64:ff9b::7f00:1"))
+
 
 class ConfigurationTest(unittest.TestCase):
     def test_port_validation(self):
@@ -137,6 +147,35 @@ class RecentDownloadRankingTest(unittest.TestCase):
 
 
 class RelayLifecycleTest(unittest.IsolatedAsyncioTestCase):
+    async def test_chunked_http_body_remains_framed_across_fragmented_reads(self):
+        source = asyncio.StreamReader()
+        payload = b"2\r\nab\r\n2\r\ncd\r\n0\r\n\r\nGET /next HTTP/1.1\r\n\r\n"
+        async def feed():
+            for byte in payload:
+                source.feed_data(bytes([byte]))
+                await asyncio.sleep(0)
+            source.feed_eof()
+        producer = asyncio.create_task(feed())
+        body = auth_proxy._HttpBodyReader(source, b"", [b"Transfer-Encoding: chunked"])
+        output = b""
+        while True:
+            data = await body.read(3)
+            if not data:
+                break
+            output += data
+        await producer
+        self.assertEqual(output, b"2\r\nab\r\n2\r\ncd\r\n0\r\n\r\n")
+        self.assertFalse(body.failed)
+
+    async def test_truncated_http_body_is_marked_failed(self):
+        source = asyncio.StreamReader()
+        source.feed_data(b"x")
+        source.feed_eof()
+        body = auth_proxy._HttpBodyReader(source, b"", [b"Content-Length: 4"])
+        self.assertEqual(await body.read(1024), b"x")
+        self.assertEqual(await body.read(1024), b"")
+        self.assertTrue(body.failed)
+
     class Writer:
         def __init__(self):
             self.data = bytearray()

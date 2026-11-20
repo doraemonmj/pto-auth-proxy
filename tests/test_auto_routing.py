@@ -42,7 +42,7 @@ class RoutePolicyTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_direct_rejects_private_mixed_and_multicast_dns_before_connecting(self):
         for addresses in (("127.0.0.1",), ("10.1.2.3",), ("169.254.169.254",),
-                          ("::1",), ("::ffff:127.0.0.1",), ("224.0.0.1",),
+                          ("::1",), ("::ffff:127.0.0.1",), ("64:ff9b::7f00:1",), ("224.0.0.1",),
                           ("93.184.216.34", "192.168.0.1")):
             records = [(socket.AF_INET6 if ":" in address else socket.AF_INET,
                         socket.SOCK_STREAM, 6, "", (address, 443)) for address in addresses]
@@ -65,6 +65,13 @@ class RoutePolicyTest(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(asyncio.get_running_loop(), "getaddrinfo") as resolve:
             with self.assertRaises(auth_proxy.DirectDenied):
                 await auth_proxy.open_direct("public.example", auth_proxy.UPSTREAM_PORT)
+            resolve.assert_not_called()
+
+    async def test_private_literals_are_rejected_before_dns(self):
+        with mock.patch.object(asyncio.get_running_loop(), "getaddrinfo") as resolve:
+            for address in ("127.0.0.1", "::1", "64:ff9b::7f00:1"):
+                with self.assertRaises(auth_proxy.DirectDenied):
+                    await auth_proxy.open_direct(address, 443)
             resolve.assert_not_called()
 
     async def test_slow_first_public_address_does_not_prevent_trying_the_next(self):
@@ -201,10 +208,65 @@ class AutoProtocolTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(b"synthetic-token", self.origin_requests[0])
         self.assertEqual(self.upstream_requests, [])
 
+    async def framed_http_request(self, framing, body):
+        async def collect(reader, writer):
+            try:
+                self.origin_requests.append(await asyncio.wait_for(reader.read(), 2))
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+        self.origin = await self.listen(collect)
+        reader, writer = await self.open_connection("127.0.0.1", self.http_auto)
+        authorization = base64.b64encode(b"testuser:synthetic-token")
+        request = (b"POST http://public.example/path HTTP/1.1\r\nHost: public.example\r\n"
+                   b"Proxy-Authorization: Basic " + authorization + b"\r\n" + framing + b"\r\n" + body)
+        # Simulate a second legitimate proxy request on a persistent connection.
+        pipeline = (b"GET http://second.example/ HTTP/1.1\r\n"
+                    b"Proxy-Authorization: Basic " + authorization + b"\r\n\r\n")
+        try:
+            writer.write(request + pipeline)
+            await writer.drain()
+            writer.write_eof()
+            return await asyncio.wait_for(reader.read(), 3)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def test_plain_http_without_body_cannot_forward_next_request_credentials(self):
+        self.assertIn(b"200 OK", await self.framed_http_request(b"", b""))
+        self.assertNotIn(b"Proxy-Authorization", self.origin_requests[0])
+        self.assertNotIn(b"second.example", self.origin_requests[0])
+
+    async def test_plain_http_content_length_limits_forwarding_to_first_body(self):
+        self.assertIn(b"200 OK", await self.framed_http_request(b"Content-Length: 4\r\n", b"data"))
+        self.assertTrue(self.origin_requests[0].endswith(b"\r\n\r\ndata"))
+        self.assertNotIn(b"Proxy-Authorization", self.origin_requests[0])
+
+    async def test_plain_http_chunked_body_and_trailers_do_not_leak_proxy_auth(self):
+        body = b"4\r\ndata\r\n0\r\nProxy-Authorization: do-not-forward\r\nChecksum: ok\r\n\r\n"
+        self.assertIn(b"200 OK", await self.framed_http_request(b"Transfer-Encoding: chunked\r\n", body))
+        self.assertIn(b"4\r\ndata\r\n0\r\nChecksum: ok\r\n\r\n", self.origin_requests[0])
+        self.assertNotIn(b"Proxy-Authorization", self.origin_requests[0])
+        self.assertNotIn(b"second.example", self.origin_requests[0])
+
+    async def test_ambiguous_http_body_framing_is_rejected_before_connection(self):
+        response = await self.framed_http_request(b"Content-Length: 4\r\nTransfer-Encoding: chunked\r\n", b"data")
+        self.assertIn(b"400 Bad Request", response)
+        self.assertEqual(self.origin_requests, [])
+
     async def test_force_proxy_keeps_whitelist_and_never_uses_direct(self):
         self.assertIn(b"403 Forbidden", await self.http_request(b"other-ai.example:443", listener=self.http_force))
         self.assertEqual(self.origin_requests, [])
         self.assertEqual(self.upstream_requests, [])
+
+    async def test_force_proxy_cannot_tunnel_back_to_loopback_even_with_ip_approval(self):
+        with mock.patch.object(auth_proxy, "_whitelist", ["127.0.0.1", "::1"]):
+            for target in (b"127.0.0.1:443", b"[::1]:443"):
+                self.assertIn(b"403 Forbidden", await self.http_request(target, listener=self.http_force))
+        self.assertEqual(self.upstream_requests, [])
+        self.assertEqual(self.origin_requests, [])
 
     async def test_auto_cannot_use_direct_forwarding_without_authentication(self):
         self.assertIn(b"407 Proxy Authentication Required", await self.http_request(b"public.example:443", auth=False))
