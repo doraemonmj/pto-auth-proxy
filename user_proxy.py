@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import re
 import signal
 import socket
 import subprocess
@@ -154,7 +155,8 @@ def system_managed(unit: str) -> bool:
 def compatibility_pids() -> list[int]:
     """Match exact per-home executable paths, never arbitrary command substrings."""
     home_bin = Path(account().pw_dir) / ".local" / "bin"
-    scripts = {str(home_bin / "authproxy-watchdog.sh"), str(home_bin / "authproxy-authd.py")}
+    watchdog = str(home_bin / "authproxy-watchdog.sh")
+    daemon = str(home_bin / "authproxy-authd.py")
     result = []
     for path in Path("/proc").iterdir():
         if not path.name.isdigit():
@@ -163,8 +165,13 @@ def compatibility_pids() -> list[int]:
             if path.stat().st_uid != os.getuid():
                 continue
             argv = path.joinpath("cmdline").read_bytes().split(b"\0")
-            # Python/bash argv[1] is the script for the compatibility launcher.
-            if len(argv) > 1 and os.fsdecode(argv[1]) in scripts:
+            if len(argv) < 2:
+                continue
+            interpreter = Path(os.fsdecode(argv[0])).name
+            script = os.fsdecode(argv[1])
+            # Reading/printing the script is not the same as executing it.
+            if ((script == watchdog and interpreter == "bash") or
+                    (script == daemon and re.fullmatch(r"python3(?:\.\d+)?", interpreter))):
                 result.append(int(path.name))
         except (OSError, ValueError):
             continue
@@ -172,13 +179,24 @@ def compatibility_pids() -> list[int]:
 
 
 def stop_compatibility() -> None:
-    # Stop the watchdog first; re-scan to include a child spawned just before exit.
-    for _ in range(2):
-        for pid in compatibility_pids():
+    # PAM workers can delay process exit. Do not launch a replacement until all
+    # matching processes have left; re-scan for children spawned during shutdown.
+    deadline = time.monotonic() + 10
+    signalled = set()
+    while True:
+        pids = compatibility_pids()
+        if not pids:
+            return
+        if time.monotonic() >= deadline:
+            raise ValueError("compatibility authd is still stopping; retry shortly")
+        for pid in pids:
+            if pid in signalled:
+                continue
             try:
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+            signalled.add(pid)
         time.sleep(0.1)
 
 

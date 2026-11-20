@@ -4,8 +4,10 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -152,6 +154,8 @@ class UserControlTest(unittest.TestCase):
             ["python3", "other.py", daemon],
             ["bash", "-c", "echo " + watchdog],
             ["python3", str(ROOT / "authd.py")],
+            ["cat", daemon],
+            ["printf", watchdog],
         )
         paths = []
         for pid, argv in enumerate(arguments, 110):
@@ -162,8 +166,71 @@ class UserControlTest(unittest.TestCase):
         with mock.patch.object(Path, "iterdir", return_value=paths):
             self.assertEqual(user_proxy.compatibility_pids(), [110, 111])
 
+    def test_compatibility_stop_waits_for_slow_daemon_exit(self):
+        clock = [0.0]
+        def advance(seconds):
+            clock[0] += seconds
+        def processes():
+            return [111] if clock[0] < 0.5 else []
+        with mock.patch.object(user_proxy, "compatibility_pids", side_effect=processes), \
+             mock.patch.object(user_proxy.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(user_proxy.time, "sleep", side_effect=advance), \
+             mock.patch.object(user_proxy.os, "kill"):
+            user_proxy.stop_compatibility()
+            self.assertEqual(processes(), [])
+
+    def test_compatibility_stop_fails_if_daemon_does_not_exit(self):
+        clock = [0.0]
+        def advance(_seconds):
+            clock[0] += 5
+        with mock.patch.object(user_proxy, "compatibility_pids", return_value=[111]), \
+             mock.patch.object(user_proxy.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(user_proxy.time, "sleep", side_effect=advance), \
+             mock.patch.object(user_proxy.os, "kill") as kill:
+            with self.assertRaisesRegex(ValueError, "still stopping"):
+                user_proxy.stop_compatibility()
+        self.assertTrue(all(call.args[1] == signal.SIGTERM for call in kill.call_args_list))
+
+    def test_real_slow_compatibility_process_has_exited_before_stop_returns(self):
+        daemon = self.home / ".local/bin/authproxy-authd.py"
+        daemon.parent.mkdir(parents=True)
+        ready = self.home / "ready"
+        daemon.write_text(
+            "import signal, sys, time\n"
+            "from pathlib import Path\n"
+            "def stop(*args):\n"
+            "    time.sleep(0.5)\n"
+            "    raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM, stop)\n"
+            "Path(sys.argv[1]).touch()\n"
+            "while True: time.sleep(1)\n")
+        process = subprocess.Popen(["python3", str(daemon), str(ready)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 5
+            while not ready.exists():
+                if time.monotonic() > deadline or process.poll() is not None:
+                    self.fail("fixture daemon did not become ready")
+                time.sleep(0.01)
+            user_proxy.stop_compatibility()
+            self.assertEqual(process.wait(timeout=1), 0)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+
 
 class ShellControlTest(unittest.TestCase):
+    def test_setup_does_not_echo_credential_with_inherited_xtrace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = {"PATH": os.environ["PATH"], "HOME": temporary,
+                           "SHELL": "/bin/bash", "SHELLOPTS": "xtrace"}
+            result = subprocess.run(["bash", str(ROOT / "configure-shell.sh"), "testuser"],
+                                    env=environment, input="synthetic-trace-secret", text=True,
+                                    capture_output=True)
+            self.assertEqual(result.returncode, 0)
+            self.assertNotIn("synthetic-trace-secret", result.stdout + result.stderr)
+
     def run_shell(self, body, shell=None):
         if shell is None:
             for candidate in ("bash", "zsh"):

@@ -176,6 +176,11 @@ class StatusTest(unittest.TestCase):
         direct.assert_not_called()
         guard.assert_not_called()
 
+    def test_logout_marker_uses_account_home_even_when_home_is_overridden(self):
+        (self.directory / "access.disabled").touch()
+        with mock.patch.object(status_proxy.Path, "home", return_value=Path("/unrelated-home")):
+            self.assertTrue(status_proxy.access_disabled())
+
     def test_shell_mode_detects_external_mixed_and_bypassed_environments(self):
         for environment, expected in (
             ({}, "direct"),

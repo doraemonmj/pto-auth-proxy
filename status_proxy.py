@@ -155,8 +155,7 @@ def guard_ports(upstream_port: int) -> tuple[int, ...]:
 
 
 def access_disabled() -> bool:
-    return (Path.home() / ".config" / "pto-auth-proxy" /
-            "access.disabled").exists()
+    return (user_proxy.access_dir() / "access.disabled").exists()
 
 
 def shell_mode(host: str, http_port: int, socks_port: int) -> str:

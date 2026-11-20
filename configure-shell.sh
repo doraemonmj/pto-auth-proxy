@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Configure future shells for pto-auth-proxy. A token (or a legacy password)
 # is accepted on stdin so it never appears in argv or the process environment.
+# SHELLOPTS may be exported by the invoking shell; never trace credential work.
+set +x
 set -Eeuo pipefail
 
 PROXY_USER=${1:-$(id -un)}
