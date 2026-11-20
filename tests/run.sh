@@ -37,7 +37,8 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PROJECT_DIR" \
 TEST_TMP=$(mktemp -d)
 trap 'rm -rf -- "$TEST_TMP"' EXIT
 CURRENT_USER=$(id -un)
-sed "s/^PTO_AUTH_PROXY_OWNER=.*/PTO_AUTH_PROXY_OWNER=$CURRENT_USER/" \
+sed -e "s/^PTO_AUTH_PROXY_OWNER=.*/PTO_AUTH_PROXY_OWNER=$CURRENT_USER/" \
+    -e 's/^PTO_AUTH_PROXY_UPSTREAM_PORT=.*/PTO_AUTH_PROXY_UPSTREAM_PORT=7895/' \
     "$PROJECT_DIR/config/auth-proxy.env.example" >"$TEST_TMP/auth-proxy.env"
 ln -s "$PROJECT_DIR/bin/pto-auth-proxy" "$TEST_TMP/pto-auth-proxy"
 "$TEST_TMP/pto-auth-proxy" --config "$TEST_TMP/auth-proxy.env" validate
@@ -118,9 +119,9 @@ grep -Fq 'REPO_AUTO_UPDATE_ADAPTER_MODE=apply' \
     "$PROJECT_DIR/modules/repo_auto_update/updater.sh"
 grep -Fq 'REPO_AUTO_UPDATE_REPOSITORY=' \
     "$PROJECT_DIR/modules/repo_auto_update/example.env"
-grep -Fq 'REPO_AUTO_UPDATE_FETCH_USER=@PROXY_USER@' \
+grep -Fq 'REPO_AUTO_UPDATE_FETCH_USER=${PTO_AUTH_PROXY_OWNER:-@PROXY_USER@}' \
     "$PROJECT_DIR/config/auto-update.env.in"
-grep -Fq 'REPO_AUTO_UPDATE_FETCH_ALL_PROXY=socks5h://127.0.0.1:4780' \
+grep -Fq 'PTO_AUTH_PROXY_UPSTREAM_PORT' \
     "$PROJECT_DIR/config/auto-update.env.in"
 grep -Fq 'runuser -u "$REPO_AUTO_UPDATE_FETCH_USER"' \
     "$PROJECT_DIR/modules/repo_auto_update/updater.sh"
@@ -194,7 +195,7 @@ grep -Fq -- '--enable-service' "$PROJECT_DIR/skills/pto-auth-proxy/SKILL.md"
 grep -Fq 'pto-auth-proxy status' "$PROJECT_DIR/skills/pto-auth-proxy/SKILL.md"
 grep -Fq 'pto-auth-proxy-authd-members.service' \
     "$PROJECT_DIR/skills/pto-auth-proxy/SKILL.md"
-grep -Fq '4780/4781' "$PROJECT_DIR/skills/pto-auth-proxy/SKILL.md"
+grep -Fq 'PTO_AUTH_PROXY_UPSTREAM_PORT' "$PROJECT_DIR/skills/pto-auth-proxy/SKILL.md"
 grep -Fq 'ten-minute rotation grace' \
     "$PROJECT_DIR/skills/pto-auth-proxy/SKILL.md"
 if grep -Fq 'PrivateTmp=true' "$PROJECT_DIR/systemd/pto-auth-proxy.service.in"; then

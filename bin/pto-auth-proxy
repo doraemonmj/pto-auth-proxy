@@ -77,8 +77,9 @@ load_config() {
     : "${PTO_AUTH_PROXY_SOCKS_PORT:=20808}"
     : "${PTO_AUTH_PROXY_HTTP_PORT:=20809}"
     : "${PTO_AUTH_PROXY_UPSTREAM_HOST:=127.0.0.1}"
-    : "${PTO_AUTH_PROXY_UPSTREAM_PORT:=4780}"
-    : "${PTO_AUTH_PROXY_GUARD_PORTS:=${PTO_AUTH_PROXY_UPSTREAM_PORT},4781}"
+    : "${PTO_AUTH_PROXY_UPSTREAM_PORT:=}"
+    : "${PTO_AUTH_PROXY_GUARD_PORTS:=${PTO_AUTH_PROXY_UPSTREAM_PORT}}"
+    export PTO_AUTH_PROXY_UPSTREAM_HOST PTO_AUTH_PROXY_UPSTREAM_PORT PTO_AUTH_PROXY_GUARD_PORTS
     : "${PTO_AUTH_PROXY_CLIENT_HANDSHAKE_TIMEOUT:=15}"
     : "${PTO_AUTH_PROXY_UPSTREAM_CONNECT_TIMEOUT:=5}"
     : "${PTO_AUTH_PROXY_UPSTREAM_HANDSHAKE_TIMEOUT:=10}"
@@ -120,9 +121,9 @@ validate() {
         echo "HTTP CONNECT 端口无效: $PTO_AUTH_PROXY_HTTP_PORT" >&2; return 1;
     }
     valid_port "$PTO_AUTH_PROXY_UPSTREAM_PORT" || {
-        echo "上游端口无效: $PTO_AUTH_PROXY_UPSTREAM_PORT" >&2; return 1;
+        echo "请在 $CONFIG 显式配置有效的 PTO_AUTH_PROXY_UPSTREAM_PORT（无默认上游端口）" >&2; return 1;
     }
-    local guard_port
+    local guard_port upstream_guarded=0
     IFS=, read -r -a guard_ports <<< "$PTO_AUTH_PROXY_GUARD_PORTS"
     ((${#guard_ports[@]} > 0)) || {
         echo "出口守卫端口不能为空" >&2; return 1;
@@ -131,7 +132,14 @@ validate() {
         valid_port "$guard_port" || {
             echo "出口守卫端口无效: $guard_port" >&2; return 1;
         }
+        if ((10#$guard_port == 10#$PTO_AUTH_PROXY_UPSTREAM_PORT)); then
+            upstream_guarded=1
+        fi
     done
+    ((upstream_guarded)) || {
+        echo "PTO_AUTH_PROXY_GUARD_PORTS 必须包含上游端口 $PTO_AUTH_PROXY_UPSTREAM_PORT" >&2
+        return 1
+    }
     local timeout_name
     for timeout_name in PTO_AUTH_PROXY_CLIENT_HANDSHAKE_TIMEOUT \
                         PTO_AUTH_PROXY_UPSTREAM_CONNECT_TIMEOUT \

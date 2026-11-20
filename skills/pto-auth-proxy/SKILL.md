@@ -35,8 +35,8 @@ changes, user onboarding, and production service operations clearly separated.
   the proxy.
 - Do not deploy directly from a dirty worktree. Do not overwrite config, state,
   logs, reports, or an existing production deployment during an upgrade.
-- Never direct a normal user or tool to `4780/4781`. Those loopback upstream
-  ports are guarded for the proxy owner only; users must use authenticated
+- Never direct a normal user or tool to the configured upstream
+  ports. These ports are guarded for the proxy owner only; users must use authenticated
   `20808/20809`.
 
 ## Read-only checks
@@ -45,7 +45,8 @@ changes, user onboarding, and production service operations clearly separated.
 pto-auth-proxy validate
 pto-auth-proxy traffic 30
 pto-auth-proxy status
-ss -lnt | grep -E ':(20808|20809|4780|4781)\b'
+ss -lnt | grep -E ':(20808|20809)\b'
+# Also inspect the upstream port explicitly configured on this host.
 ```
 
 Inspect only credential-free fields when diagnosing configuration. Proxy URLs
@@ -120,6 +121,20 @@ accepts the additional egress.
 
 ## Configuration changes
 
+Do not assume any backend product or port. Read `PTO_AUTH_PROXY_UPSTREAM_HOST`
+and `PTO_AUTH_PROXY_UPSTREAM_PORT` from the installed config, then compare with
+the backend listener and the latest proxy startup log. The upstream speaks
+standard no-auth SOCKS5; a local mihomo mixed-port or an SSH tunnel is valid.
+The upstream port has no default. Never discover it by probing arbitrary ports
+or replace an existing configured port with a documentation example.
+`PTO_AUTH_PROXY_GUARD_PORTS` defaults to the configured upstream port; an explicit
+list must include that port. On older installations, remove obsolete guard
+values when changing the upstream. Check `config/auto-update.env` too: new
+templates read the same auth-proxy config, but upgrades preserve existing local
+updater config, including any legacy fixed fetch proxy. Migrate that section
+explicitly before relying on the updater. Backend service/tunnel lifecycle stays
+with its own service manager.
+
 Before proposing a change:
 
 1. Read the current installed config and whitelist with secrets redacted.
@@ -177,7 +192,8 @@ create its own root-owned config from `example.env`, and provide its own verify
 and apply adapters; do not add other tools' behavior to the generic engine.
 
 The egress guard uses IPv4/IPv6 owner rules so only the configured proxy owner
-can connect directly to loopback `4780/4781`. The authenticated service remains
+can connect directly to the configured loopback upstream ports. The authenticated
+service remains
 non-root and reaches the upstream as that owner. The guard continuously checks
 and repairs rule drift, and the shared proxy verifies the rules before each
 start. Verify the service and access matrix with `pto-auth-proxy status` after

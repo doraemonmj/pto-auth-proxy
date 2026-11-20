@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """SOCKS5 auth proxy — PAM-authenticated, group-gated, whitelist-filtered.
 
-Runs on the Ascend686 tunnel host. Users authenticate with their Linux
-username + Linux password (via PAM). Only members of PROXY_GROUP are allowed
-in, even with correct credentials. Matching destinations are forwarded to
-UPSTREAM (the SSH RemoteForward landing that reaches the workstation's xray).
+Runs on shared Linux hosts. Users authenticate through their per-user authd.
+Only members of PROXY_GROUP are allowed in, even with correct credentials.
+Matching destinations are forwarded to an explicitly configured SOCKS5 upstream,
+independent of its implementation (for example mihomo or an SSH tunnel).
 
 Per-connection facts append to stats.jsonl; a plain text log lands in
 auth_proxy.log. SIGHUP reloads the whitelist file (if present); SIGTERM/INT
@@ -34,8 +34,10 @@ from typing import Optional
 # /run/user/<uid>/authproxy-authd.sock and asks THAT daemon to run PAM.
 
 # ---- config knobs --------------------------------------------------------
-def _env_port(name: str, default: int) -> int:
-    raw = os.environ.get(name, str(default))
+def _env_port(name: str, default: Optional[int] = None) -> int:
+    raw = os.environ.get(name, "" if default is None else str(default))
+    if not raw:
+        raise SystemExit(f"{name} must be explicitly configured; no default upstream port")
     try:
         value = int(raw)
     except ValueError as exc:
@@ -85,10 +87,10 @@ LISTEN_HOST    = os.environ.get("PTO_AUTH_PROXY_LISTEN_HOST", "127.0.0.1")
 LISTEN_PORT    = _env_port("PTO_AUTH_PROXY_SOCKS_PORT", 20808)
 HTTP_LISTEN_PORT = _env_port("PTO_AUTH_PROXY_HTTP_PORT", 20809)
 # Every allowed business connection is chained through this SOCKS5 endpoint.
-# On the production host, 127.0.0.1:4780 is the local landing of an SSH
-# RemoteForward to the workstation's xray; it is not created by this process.
+# The endpoint may be a local SOCKS5 service or an SSH RemoteForward.
+# Do not infer the backend implementation or silently choose a legacy port.
 UPSTREAM_HOST  = os.environ.get("PTO_AUTH_PROXY_UPSTREAM_HOST", "127.0.0.1")
-UPSTREAM_PORT  = _env_port("PTO_AUTH_PROXY_UPSTREAM_PORT", 4780)
+UPSTREAM_PORT  = _env_port("PTO_AUTH_PROXY_UPSTREAM_PORT")
 PROXY_OWNER    = os.environ.get("PTO_AUTH_PROXY_OWNER", "pypto")
 PROXY_GROUP    = os.environ.get("PTO_AUTH_PROXY_GROUP", "proxyusers")
 PAM_SERVICE    = os.environ.get("PTO_AUTH_PROXY_PAM_SERVICE", "sshd")
@@ -574,7 +576,7 @@ async def handle(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> None:
 #   2. Method MUST be CONNECT (we don't do plain-HTTP proxying)
 #   3. Enforce Proxy-Authorization: Basic user:pw   -> authd
 #   4. Enforce whitelist on the CONNECT target
-#   5. Open SOCKS5 to UPSTREAM (which is xray) and hand it the target
+#   5. Open SOCKS5 to the configured UPSTREAM and hand it the target
 #   6. Reply "HTTP/1.1 200 Connection Established" and pipe both ways
 # ============================================================
 import base64 as _b64

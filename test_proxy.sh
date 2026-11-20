@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# test_proxy.sh — self-test for the authenticated SOCKS5 proxy on Ascend686.
+# test_proxy.sh — self-test for the authenticated SOCKS5 entry point.
 #
-# Run this on the Ascend686 host as your Linux user. It walks you through
+# Run this on the proxy host as your Linux user. It walks you through
 # every check needed to confirm the new proxy works for you, without
-# affecting anyone still using the old :4780 tunnel.
+# changing the configured upstream or other users' connections.
 #
 # Usage:
 #   pto-auth-proxy test

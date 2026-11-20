@@ -7,7 +7,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import auth_proxy
+with mock.patch.dict("os.environ", {"PTO_AUTH_PROXY_UPSTREAM_PORT": "7895"}):
+    import auth_proxy
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
