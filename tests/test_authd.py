@@ -1,4 +1,7 @@
+import json
+import socket
 import stat
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,7 +10,7 @@ from unittest import mock
 import authd
 
 
-class ProxyTokenTest(unittest.TestCase):
+class ProxyTokenTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.token_dir = Path(self.tempdir.name) / "pto-auth-proxy"
@@ -54,6 +57,39 @@ class ProxyTokenTest(unittest.TestCase):
         with mock.patch.object(authd.time, "time", return_value=2000):
             self.assertFalse(authd._token_matches(first))
             self.assertTrue(authd._token_matches(second))
+
+    async def request_token(self, candidate):
+        reader = mock.Mock()
+        reader.readline = mock.AsyncMock(return_value=json.dumps({
+            "op": "issue-token", "user": authd._MY_NAME, "pass": "password",
+            "current_token": candidate,
+        }).encode())
+        writer = mock.Mock()
+        writer.drain = mock.AsyncMock()
+        peer = writer.get_extra_info.return_value
+        peer.family = socket.AF_UNIX
+        peer.getsockopt.return_value = struct.pack("iII", 1, authd._UID, 0)
+        with mock.patch.object(authd, "_pam_call_async",
+                               new=mock.AsyncMock(return_value=(True, 0, "ok"))), \
+             mock.patch.object(authd, "_cache_put"):
+            await authd.handle(reader, writer)
+        return json.loads(writer.write.call_args.args[0])
+
+    async def test_join_reuses_current_token_without_rewriting_digest(self):
+        token = authd._issue_proxy_token()
+        before = self.token_file.stat().st_ino
+        reply = await self.request_token(token)
+        self.assertTrue(reply["reused"])
+        self.assertEqual(reply["token"], token)
+        self.assertEqual(self.token_file.stat().st_ino, before)
+
+    async def test_join_does_not_reuse_token_in_rotation_grace(self):
+        previous = authd._issue_proxy_token()
+        authd._issue_proxy_token()
+        self.assertTrue(authd._token_matches(previous))
+        reply = await self.request_token(previous)
+        self.assertNotEqual(reply["token"], previous)
+        self.assertTrue(authd._token_matches(reply["token"], allow_previous=False))
 
     def test_disable_revokes_tokens_and_enable_clears_marker(self):
         token = authd._issue_proxy_token()

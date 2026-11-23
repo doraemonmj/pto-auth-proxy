@@ -193,7 +193,7 @@ def _looks_like_proxy_token(credential: str) -> bool:
         and all(char in _TOKEN_ALPHABET for char in body)
 
 
-def _token_matches(token: str) -> bool:
+def _token_matches(token: str, *, allow_previous: bool = True) -> bool:
     if not token.startswith(_TOKEN_PREFIX):
         return False
     try:
@@ -208,7 +208,8 @@ def _token_matches(token: str) -> bool:
             return True
         previous = str(record.get("previous", ""))
         previous_until = float(record.get("previous_until", 0))
-        return previous_until >= time.time() and hmac.compare_digest(previous, digest)
+        return (allow_previous and previous_until >= time.time()
+                and hmac.compare_digest(previous, digest))
     except (TypeError, ValueError, json.JSONDecodeError):
         # Compatibility with the initial single-digest token file format.
         return hmac.compare_digest(stored, digest)
@@ -365,7 +366,13 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
                 reply = {"ok": ok, "code": code, "reason": reason}
                 if ok:
                     _cache_put(user, credential)
-                    reply["token"] = _issue_proxy_token()
+                    candidate = req.get("current_token")
+                    if (isinstance(candidate, str) and _looks_like_proxy_token(candidate)
+                            and not _access_disabled()
+                            and _token_matches(candidate, allow_previous=False)):
+                        reply.update(token=candidate, reused=True)
+                    else:
+                        reply["token"] = _issue_proxy_token()
                     _enable_proxy_access()
         elif op == "revoke-token":
             if peer_uid != _UID:
