@@ -195,6 +195,10 @@ pass "socket ready at $SOCK"
 ls -l "$SOCK"
 
 header "Step 5: verify authd and configure future shells"
+info "Your Linux password is checked once over the local unix socket."
+info "New authd versions exchange it for a revocable random proxy token."
+read -r -s -p "Your Linux password: " PW || [[ -n "$PW" ]] || exit 1
+echo
 AUTHD_CONFIG_HOME=$HOME/.config/pto-auth-proxy
 install -d -m 0700 "$AUTHD_CONFIG_HOME" || exit 1
 exec {CREDENTIAL_LOCK}>"$AUTHD_CONFIG_HOME/credentials.lock" || exit 1
@@ -203,10 +207,6 @@ if ! bash "$SRC_DIR/configure-shell.sh" --check "$ME"; then
   fail "Cannot configure the proxy in the shell startup file"
   exit 1
 fi
-info "Your Linux password is checked once over the local unix socket."
-info "New authd versions exchange it for a revocable random proxy token."
-read -r -s -p "Your Linux password: " PW
-echo
 # Pass only the socket and username via env. The password is fed over stdin so
 # neither the Linux password nor issued token appears in argv or environment.
 AUTH_RESULT=$(SOCK="$SOCK" USER_NAME="$ME" python3 -c '
@@ -294,8 +294,6 @@ if [[ "$AUTH_MODE" == token* ]]; then
 else
   info "Current authd will gain token support after its next system-managed start."
 fi
-unset AUTH_MODE
-
 pass "future shells are configured for authenticated proxy port ${PTO_AUTH_PROXY_HTTP_PORT:-20809}"
 
 echo
@@ -315,8 +313,10 @@ else
 fi
 echo "  - proxy environment: ${XDG_CONFIG_HOME:-$HOME/.config}/pto-auth-proxy/env.sh"
 echo "  - open a new terminal to inherit it"
-echo "  - VS Code / Codex already running must use Reload Window when convenient"
-echo "  - no running process was restarted by join"
+if [[ "$AUTH_MODE" != token-reused ]]; then
+  echo "  - reopen tools that still use an older proxy credential"
+fi
+unset AUTH_MODE
 echo
 echo "  Optional end-to-end verification:"
 echo "       pto-auth-proxy test"

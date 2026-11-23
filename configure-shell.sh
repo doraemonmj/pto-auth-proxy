@@ -59,7 +59,7 @@ fi
 if [[ ! -e "$SHELL_RC" ]]; then
     if ((CHECK_ONLY)); then
         [[ -w "$(dirname -- "$SHELL_RC")" ]]
-        exit $?
+        exit 0
     fi
     install -m 0644 /dev/null "$SHELL_RC"
 fi
