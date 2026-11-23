@@ -3,6 +3,11 @@
 # is accepted on stdin so it never appears in argv or the process environment.
 set -Eeuo pipefail
 
+CHECK_ONLY=0
+if [[ ${1:-} == --check ]]; then
+    CHECK_ONLY=1
+    shift
+fi
 PROXY_USER=${1:-$(id -un)}
 HTTP_HOST=${PTO_AUTH_PROXY_LISTEN_HOST:-127.0.0.1}
 HTTP_PORT=${PTO_AUTH_PROXY_HTTP_PORT:-20809}
@@ -52,6 +57,10 @@ if [[ -L "$SHELL_RC" ]]; then
     }
 fi
 if [[ ! -e "$SHELL_RC" ]]; then
+    if ((CHECK_ONLY)); then
+        [[ -w "$(dirname -- "$SHELL_RC")" ]]
+        exit 0
+    fi
     install -m 0644 /dev/null "$SHELL_RC"
 fi
 [[ -f "$SHELL_RC" && -w "$SHELL_RC" ]] || {
@@ -68,6 +77,8 @@ if ((begin_count != end_count || begin_count > 1 ||
     echo "Refusing to edit malformed proxy block in $SHELL_RC_DISPLAY" >&2
     exit 1
 fi
+
+((CHECK_ONLY == 0)) || exit 0
 
 PROXY_CREDENTIAL=
 IFS= read -r PROXY_CREDENTIAL || true

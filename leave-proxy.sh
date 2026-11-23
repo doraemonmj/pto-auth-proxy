@@ -141,6 +141,9 @@ PY
     fi
 }
 
+install -d -m 0700 "$AUTHD_CONFIG_HOME"
+exec {CREDENTIAL_LOCK}>"$AUTHD_CONFIG_HOME/credentials.lock"
+flock -x "$CREDENTIAL_LOCK"
 disable_access
 revoke_running_authd || FAILED=1
 stop_compatibility_authd

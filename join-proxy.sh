@@ -197,12 +197,22 @@ ls -l "$SOCK"
 header "Step 5: verify authd and configure future shells"
 info "Your Linux password is checked once over the local unix socket."
 info "New authd versions exchange it for a revocable random proxy token."
-read -r -s -p "Your Linux password: " PW
+read -r -s -p "Your Linux password: " PW || [[ -n "$PW" ]] || exit 1
 echo
+AUTHD_CONFIG_HOME=$HOME/.config/pto-auth-proxy
+install -d -m 0700 "$AUTHD_CONFIG_HOME" || exit 1
+exec {CREDENTIAL_LOCK}>"$AUTHD_CONFIG_HOME/credentials.lock" || exit 1
+flock -x "$CREDENTIAL_LOCK" || exit 1
+if ! bash "$SRC_DIR/configure-shell.sh" --check "$ME"; then
+  fail "Cannot configure the proxy in the shell startup file"
+  exit 1
+fi
 # Pass only the socket and username via env. The password is fed over stdin so
 # neither the Linux password nor issued token appears in argv or environment.
 AUTH_RESULT=$(SOCK="$SOCK" USER_NAME="$ME" python3 -c '
 import socket, sys, os, json
+from pathlib import Path
+from urllib.parse import unquote
 pw = sys.stdin.read().rstrip("\n")
 
 def request(payload):
@@ -224,12 +234,18 @@ def request(payload):
 user = os.environ["USER_NAME"]
 capabilities = request({"op": "capabilities"})
 if capabilities.get("ok") and "token-v1" in capabilities.get("capabilities", []):
-    response = request({"op": "issue-token", "user": user, "pass": pw})
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    try:
+        candidate = unquote((config_home / "pto-auth-proxy" / "secret-uri").read_text())
+    except (OSError, UnicodeError):
+        candidate = ""
+    response = request({"op": "issue-token", "user": user, "pass": pw,
+                        "current_token": candidate})
     if not response.get("ok") or not response.get("token"):
         print("authentication failed: " + str(response.get("reason", "unknown")),
               file=sys.stderr)
         raise SystemExit(1)
-    print("token")
+    print("token-reused" if response.get("reused") else "token")
     print(response["token"], end="")
 else:
     response = request({"user": user, "pass": pw})
@@ -256,7 +272,9 @@ if [[ "$AUTH_RESULT" == "$PROXY_CREDENTIAL" || -z "$PROXY_CREDENTIAL" ]]; then
   exit 1
 fi
 unset AUTH_RESULT
-if [[ "$AUTH_MODE" == token ]]; then
+if [[ "$AUTH_MODE" == token-reused ]]; then
+  pass "Linux password verified; current proxy token reused"
+elif [[ "$AUTH_MODE" == token ]]; then
   pass "Linux password verified; an independent proxy token was issued"
 else
   pass "Linux password verified; legacy authd requires password compatibility mode"
@@ -271,13 +289,11 @@ fi
 unset PROXY_CREDENTIAL
 rm -f -- "$DISABLED_FILE"
 
-if [[ "$AUTH_MODE" == token ]]; then
+if [[ "$AUTH_MODE" == token* ]]; then
   pass "future shells use the proxy token; Linux password is not stored"
 else
   info "Current authd will gain token support after its next system-managed start."
 fi
-unset AUTH_MODE
-
 pass "future shells are configured for authenticated proxy port ${PTO_AUTH_PROXY_HTTP_PORT:-20809}"
 
 echo
@@ -297,8 +313,10 @@ else
 fi
 echo "  - proxy environment: ${XDG_CONFIG_HOME:-$HOME/.config}/pto-auth-proxy/env.sh"
 echo "  - open a new terminal to inherit it"
-echo "  - VS Code / Codex already running must use Reload Window when convenient"
-echo "  - no running process was restarted by join"
+if [[ "$AUTH_MODE" != token-reused ]]; then
+  echo "  - reopen tools that still use an older proxy credential"
+fi
+unset AUTH_MODE
 echo
 echo "  Optional end-to-end verification:"
 echo "       pto-auth-proxy test"
